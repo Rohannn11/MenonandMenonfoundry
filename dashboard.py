@@ -2,187 +2,307 @@ import streamlit as st
 import psycopg2
 import os
 import time
+from datetime import datetime
 from dotenv import load_dotenv
-from foundry_brain import FoundryBrain
 
-# --- 1. CONFIGURATION ---
+# Import the AI Brain
+from core.brain import AgentBrain
+
+# --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Foundry OS Final",
+    page_title="Menon Foundry OS",
     page_icon="🏭",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
+
 load_dotenv()
 
-# --- 2. CSS STYLING (Dark Industrial Theme) ---
+# --- 2. CSS STYLING (Dual Theme) ---
 st.markdown("""
-<style>
-    /* Main Background */
-    .stApp { background-color: #0f1215; color: #e0e6ed; }
-    
-    /* Metrics Cards */
-    .metric-card {
-        background: linear-gradient(135deg, rgba(30, 35, 40, 0.9), rgba(20, 25, 30, 0.9));
-        border: 1px solid #333;
-        border-left: 5px solid #00ccff;
-        padding: 15px;
-        border-radius: 6px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        margin-bottom: 15px;
-        transition: transform 0.2s;
+    <style>
+    /* === GLOBAL DARK THEME (SCADA) === */
+    .stApp {
+        background-color: #0b0c10;
+        color: #c5c6c7;
     }
-    .metric-card:hover { transform: translateY(-2px); border-left-color: #00ff99; }
     
-    /* Text Styles */
-    .card-label { font-size: 12px; text-transform: uppercase; color: #8899a6; letter-spacing: 1px; }
-    .card-value { font-size: 28px; font-weight: 700; color: #ffffff; font-family: 'Courier New', monospace; }
-    .card-meta { font-size: 11px; color: #555; text-align: right; margin-top: 5px; }
+    /* === TAB STYLING === */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+        background-color: #1f2833;
+        padding: 10px 20px;
+        border-radius: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: #c5c6c7;
+        font-weight: bold;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #66fcf1 !important;
+        border-bottom-color: #66fcf1 !important;
+    }
+
+    /* === SCADA CARD STYLES (TAB 1) === */
+    div[data-testid="stMetricValue"] {
+        font-family: 'Consolas', monospace;
+        color: #66fcf1 !important;
+    }
+    .scada-card {
+        background-color: #1f2833;
+        border: 1px solid #45a29e;
+        border-radius: 4px;
+        padding: 15px;
+        margin-bottom: 10px;
+    }
+    .status-ok { border-left: 5px solid #00FF00; }
+    .status-warn { border-left: 5px solid #FFA500; }
+    .status-crit { border-left: 5px solid #FF0000; }
+    .status-idle { border-left: 5px solid #555; }
     
-    /* Chat Interface */
-    .stChatMessage { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; }
-    .stChatInput { background-color: #0d1117; }
-</style>
-""", unsafe_allow_html=True)
+    .card-title { font-size: 14px; font-weight: bold; color: #fff; text-transform: uppercase; }
+    .card-value { font-size: 24px; font-family: 'Consolas', monospace; color: #66fcf1; font-weight: bold; }
+    .data-row { font-family: 'Courier New', monospace; font-size: 11px; color: #c5c6c7; margin-top: 5px; border-top: 1px solid #333; padding-top: 5px; }
+    .highlight-val { color: #fff; font-weight: bold; }
+    
+    .console-box { 
+        background-color: #000; color: #00FF00; 
+        font-family: 'Courier New', monospace; 
+        padding: 10px; height: 200px; 
+        overflow-y: scroll; border: 1px solid #333; 
+        font-size: 12px; 
+    }
 
-# --- 3. INITIALIZATION (Cached) ---
-@st.cache_resource
-def get_brain():
-    """Load the Agent (Llama 3 + Tools). Runs once."""
-    return FoundryBrain()
+    /* === CHATBOT THEME (TAB 2) - Light Purple & Black === */
+    /* This targets the specific chat message containers */
+    
+    /* User Message */
+    .stChatMessage[data-testid="stChatMessage"]:nth-child(odd) {
+        background-color: #E0E0E0 !important; /* Light Grey */
+        border: 1px solid #ccc;
+        color: #000000 !important;
+    }
+    
+    /* Assistant Message */
+    .stChatMessage[data-testid="stChatMessage"]:nth-child(even) {
+        background-color: #E6E6FA !important; /* Lavender / Light Purple */
+        border: 1px solid #9370DB;
+        color: #000000 !important;
+    }
+    
+    /* Force text inside chat bubbles to be black for visibility */
+    .stChatMessage p {
+        color: #000000 !important;
+        font-weight: 500;
+    }
+    
+    /* Chat Input Area */
+    .stChatInputContainer {
+        padding-bottom: 20px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-@st.cache_resource
+# --- 3. CONFIG & CONNECTIONS ---
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "database": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASS"),
+    "port": os.getenv("DB_PORT", "5432")
+}
+
+PIPELINES = [
+    {"name": "01 MATERIALS", "table": "material_master", "pk": "Material_Number", "cols": ["Material_Type", "Base_Unit", "Procurement_Type"], "status_col": "Procurement_Type", "crit_vals": []},
+    {"name": "02 BOMs", "table": "bill_of_materials", "pk": "BOM_Number", "cols": ["Parent_Material", "Component_Type", "BOM_Status"], "status_col": "BOM_Status", "crit_vals": ["INACTIVE", "PENDING"]},
+    {"name": "03 MELTING", "table": "melting_heat_records", "pk": "Heat_Number", "cols": ["Target_Alloy", "Tap_Temperature_C", "Quality_Status"], "status_col": "Quality_Status", "crit_vals": ["REJECTED"]},
+    {"name": "04 MOLDING", "table": "molding_records", "pk": "Production_Order", "cols": ["Molding_Type", "Defect_Type", "Quality_Check"], "status_col": "Quality_Check", "crit_vals": ["FAIL", "REWORK"]},
+    {"name": "05 CASTING", "table": "casting_records", "pk": "Casting_Batch", "cols": ["Product_Type", "Defects_Detected", "Quality_Grade"], "status_col": "Quality_Grade", "crit_vals": ["SCRAP", "C"]},
+    {"name": "06 HEAT TREAT", "table": "heat_treatments", "pk": "HT_Batch_Number", "cols": ["Treatment_Type", "Rejection_Reason", "Quality_Status"], "status_col": "Quality_Status", "crit_vals": ["REJECTED", "REWORK"]},
+    {"name": "07 MACHINING", "table": "machining_operations", "pk": "Operation_ID", "cols": ["Machine_Type", "Defect_Type", "Quality_Status"], "status_col": "Quality_Status", "crit_vals": ["FAIL", "REWORK"]},
+    {"name": "08 QUALITY QC", "table": "quality_inspections", "pk": "Inspection_Lot", "cols": ["Inspection_Stage", "Defect_Count", "Overall_Decision"], "status_col": "Overall_Decision", "crit_vals": ["REJECT", "CONDITIONAL"]},
+    {"name": "09 INVENTORY", "table": "inventory_movements", "pk": "Document_Number", "cols": ["Movement_Type", "Quantity", "Material_Number"], "status_col": "Movement_Type", "crit_vals": ["SCRAP", "RETURN"]},
+    {"name": "10 PRODUCTION", "table": "production_orders", "pk": "Production_Order", "cols": ["Order_Status", "Priority", "Product_Type"], "status_col": "Order_Status", "crit_vals": ["CLOSED"]},
+    {"name": "11 MAINTENANCE", "table": "equipment_maintenance", "pk": "Maintenance_Order", "cols": ["Equipment_Type", "Maintenance_Type", "Status"], "status_col": "Maintenance_Type", "crit_vals": ["BREAKDOWN", "CORRECTIVE"]},
+]
+
 def get_db_connection():
-    """Connect to Postgres. Cached to prevent reconnection loops."""
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        database=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASS"),
-        port=os.getenv("DB_PORT")
-    )
-
-try:
-    brain = get_brain()
-    # Test DB connection briefly
-    conn = get_db_connection()
-    conn.close()
-    db_status = "ONLINE"
-except Exception as e:
-    db_status = "OFFLINE"
-    st.error(f"System Startup Error: {e}")
-
-# --- 4. SIDEBAR ---
-with st.sidebar:
-    st.title("🏭 FOUNDRY OS")
-    st.caption(f"System Status: {db_status}")
-    st.markdown("---")
-    
-    st.subheader("Agent Capabilities")
-    st.info("🧠 **Model:** Llama 3.3 (70B)")
-    st.success("🔌 **Connected Tools:**\n- PostgreSQL (Live Data)\n- ChromaDB (SOPs)\n- NewsAPI (Global)\n- OpenMeteo (Weather)\n- Yahoo Finance (Markets)")
-    
-    st.markdown("---")
-    if st.button("🗑️ Clear Chat Memory"):
-        st.session_state.messages = []
-        st.rerun()
-
-# --- 5. MAIN TABS ---
-tab_live, tab_agent = st.tabs(["🚀 LIVE OPERATIONS", "🌐 OMNI-AGENT"])
-
-# ==================================================
-# TAB 1: LIVE OPERATIONS (The Command Center)
-# ==================================================
-with tab_live:
-    col_header, col_btn = st.columns([4,1])
-    with col_header:
-        st.markdown("### 📊 PRODUCTION METRICS")
-    with col_btn:
-        if st.button("🔄 Refresh Data"):
-            st.rerun()
-
-    # Define the Pipelines we want to monitor
-    PIPELINES = [
-        {"name": "01 Raw Materials", "table": "material_master", "pk": "material_number"},
-        {"name": "03 Melting Furnaces", "table": "melting_heat_records", "pk": "heat_number"},
-        {"name": "04 Molding Lines", "table": "molding_records", "pk": "production_order"},
-        {"name": "05 Casting Batches", "table": "casting_records", "pk": "casting_batch"},
-        {"name": "09 Inventory Ops", "table": "inventory_movements", "pk": "document_number"},
-        {"name": "11 Maintenance Orders", "table": "equipment_maintenance", "pk": "maintenance_order"}
-    ]
-
     try:
-        # Fetch Data
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Create a Grid Layout
-        cols = st.columns(3)
-        
-        for i, p in enumerate(PIPELINES):
-            # Get Total Count
-            cur.execute(f"SELECT COUNT(*) FROM {p['table']}")
-            count = cur.fetchone()[0]
-            
-            # Get Latest ID
-            cur.execute(f"SELECT {p['pk']} FROM {p['table']} ORDER BY {p['pk']} DESC LIMIT 1")
-            last_id = cur.fetchone()
-            last_id_str = str(last_id[0]) if last_id else "N/A"
-            
-            # Render Card
-            with cols[i % 3]:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="card-label">{p['name']}</div>
-                    <div class="card-value">{count:,}</div>
-                    <div class="card-meta">LATEST ID: {last_id_str}</div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        cur.close()
-        
-    except Exception as e:
-        st.error(f"Live Data Error: {e}")
+        return psycopg2.connect(**DB_CONFIG)
+    except: return None
 
-# ==================================================
-# TAB 2: OMNI-AGENT (The Flexible Chat)
-# ==================================================
-with tab_agent:
-    st.markdown("### 💬 CONTEXTUAL INTERFACE")
+@st.cache_resource
+def get_agent():
+    return AgentBrain()
+
+def fetch_live_data(conn):
+    state = {}
+    total_rows = 0
+    try:
+        cursor = conn.cursor()
+        for p in PIPELINES:
+            cursor.execute(f"SELECT COUNT(*) FROM {p['table']}")
+            count = cursor.fetchone()[0]
+            total_rows += count
+            
+            cols_query = ", ".join([p['pk']] + p['cols'])
+            cursor.execute(f"SELECT {cols_query} FROM {p['table']} ORDER BY {p['pk']} DESC LIMIT 1")
+            last_row = cursor.fetchone()
+            
+            state[p['name']] = {
+                "count": count, "data": last_row,
+                "keys": [p['pk']] + p['cols'],
+                "status_check": (p['status_col'], p['crit_vals'])
+            }
+        return state, total_rows
+    except: return None, 0
+
+# --- 4. LAYOUT SETUP ---
+st.title("🏭 Menon & Menon Foundry OS")
+tab1, tab2 = st.tabs(["📊 LIVE OPERATIONS (SCADA)", "🤖 INTELLIGENCE AGENT"])
+
+# ==========================================
+# TAB 1: LIVE SCADA (Unchanged Logic)
+# ==========================================
+with tab1:
+    c1, c2 = st.columns([3, 1])
+    c1.markdown("Monitor real-time ingestion from **11 Parallel Pipelines**.")
     
-    # Initialize Chat History
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{
-            "role": "assistant", 
-            "content": "I am online. I can access factory databases, SOPs, and live global market data. How can I assist?"
-        }]
+    # CONTROL: Live Refresh Toggle
+    # We store this in session state so it persists
+    if "live_mode" not in st.session_state: st.session_state["live_mode"] = True
+    
+    live_mode = c2.toggle("🔴 LIVE REFRESH", value=st.session_state["live_mode"], key="toggle_live")
+    st.session_state["live_mode"] = live_mode # Sync state
 
-    # Display History
+    # Init State
+    if "prev_total" not in st.session_state: st.session_state["prev_total"] = 0
+    if "console_logs" not in st.session_state: st.session_state["console_logs"] = []
+
+    # Data Fetch
+    conn = get_db_connection()
+    if conn:
+        current_state, total_rows = fetch_live_data(conn)
+        conn.close()
+
+        if current_state:
+            # Metrics
+            velocity = total_rows - st.session_state["prev_total"]
+            st.session_state["prev_total"] = total_rows
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Records", f"{total_rows:,}")
+            m2.metric("System Velocity", f"{velocity} events/sec")
+            if velocity > 0: m3.success("SYSTEM ONLINE")
+            else: m3.info("SYSTEM IDLE")
+
+            # Logging
+            if velocity > 0:
+                ts = datetime.now().strftime("%H:%M:%S")
+                st.session_state["console_logs"].append(f"[{ts}] [INFO] Processed {velocity} new records.")
+
+            # Grid
+            grid_placeholder = st.empty()
+            with grid_placeholder.container():
+                cols = st.columns(4)
+                for i, p in enumerate(PIPELINES):
+                    info = current_state[p['name']]
+                    count = info['count']
+                    row_data = info['data']
+                    
+                    pk_val = "WAITING"
+                    details = {}
+                    is_crit = False
+                    
+                    if row_data:
+                        data_dict = dict(zip(info['keys'], row_data))
+                        pk_val = data_dict.pop(p['pk'])
+                        details = data_dict
+                        
+                        stat_col, crit_vals = info['status_check']
+                        val = str(data_dict.get(stat_col, ""))
+                        if val in crit_vals:
+                            is_crit = True
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            log_msg = f"[{ts}] [ALERT] {p['name']}: {pk_val} -> {stat_col}={val}"
+                            if not st.session_state["console_logs"] or st.session_state["console_logs"][-1] != log_msg:
+                                st.session_state["console_logs"].append(log_msg)
+
+                    if is_crit: css_class = "status-crit"
+                    elif velocity > 0: css_class = "status-ok"
+                    else: css_class = "status-idle"
+
+                    detail_html = "".join([f"<div><span style='color:#66fcf1'>{k}:</span> <span class='highlight-val'>{v}</span></div>" for k, v in details.items()])
+                    
+                    with cols[i % 4]:
+                        st.markdown(f"""
+                        <div class="scada-card {css_class}">
+                            <div class="card-title">{p['name']} <span class="card-delta">{pk_val}</span></div>
+                            <div class="card-value">{count:,}</div>
+                            <div class="data-row">{detail_html}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # Console Log
+            st.markdown("### 📟 SYSTEM EVENT LOG")
+            if len(st.session_state["console_logs"]) > 15:
+                st.session_state["console_logs"] = st.session_state["console_logs"][-15:]
+            logs_html = "<br>".join(reversed(st.session_state["console_logs"]))
+            st.markdown(f'<div class="console-box">{logs_html}</div>', unsafe_allow_html=True)
+
+    else:
+        st.error("❌ DB Connection Failed. Is 'executor.py' running?")
+
+
+# ==========================================
+# TAB 2: AI AGENT (Light Purple Theme)
+# ==========================================
+with tab2:
+    st.markdown("### 🤖 Industrial Intelligence Agent")
+    st.caption("Access Market Data, News, and Internal SOPs.")
+    
+    # Initialize Agent
+    try:
+        agent = get_agent()
+        status_color = "🟢"
+    except:
+        agent = None
+        status_color = "🔴"
+
+    with st.sidebar:
+        st.markdown(f"**Agent Status:** {status_color}")
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.messages = []
+
+    # Chat Logic
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "assistant", "content": "Hello. I am connected to the Foundry Knowledge Base. How can I help?"}]
+
+    # Render History
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     # Chat Input
-    if prompt := st.chat_input("Ask anything (e.g., 'Compare our scrap inventory with global steel prices')..."):
-        # 1. User Message
+    if prompt := st.chat_input("Ex: 'What is the price of steel?'"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 2. Agent Response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # The Brain handles the routing dynamically
-                    answer, src, intent = brain.ask(prompt)
-                    
-                    st.markdown(answer)
-                    
-                    # Optional: Add technical details in an expander
-                    with st.expander("🔍 View Process Details"):
-                        st.markdown(f"**Intent:** {intent}")
-                        st.markdown(f"**Source:** {src}")
-                    
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                    
-                except Exception as e:
-                    st.error(f"Agent Failure: {e}")
+            with st.spinner("Processing request..."):
+                if agent:
+                    response = agent.ask(prompt)
+                    st.markdown(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                else:
+                    st.error("Agent is unavailable.")
+
+# ==========================================
+# 5. GLOBAL EXECUTION CONTROL
+# ==========================================
+# This logic is placed at the end so BOTH tabs render first.
+if live_mode:
+    time.sleep(1)
+    st.rerun()

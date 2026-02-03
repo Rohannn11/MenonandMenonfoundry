@@ -1,0 +1,9 @@
+streamlit
+langchain
+chromadb
+sentence-transformers
+groq
+yfinance
+requests
+python-dotenv
+openai
