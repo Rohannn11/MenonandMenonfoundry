@@ -1,96 +1,140 @@
 import os
-from tenacity import retry, stop_after_attempt, wait_exponential
+import time
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.utilities import SQLDatabase
 from langchain_chroma import Chroma
-from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from api_connectors import get_metal_prices, get_foundry_news
+from api_connectors import get_metal_prices, get_pune_weather, get_foundry_news, format_for_llm
+import warnings
+import logging
 
+# --- 1. SILENCE WARNINGS (Must be before other imports) ---
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"      # Turns off OneDNN custom operations info
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # 3 = FATAL only (hides INFO and WARNING)
+warnings.filterwarnings("ignore")              # Hides Python FutureWarnings/Deprecations
+logging.getLogger("transformers").setLevel(logging.ERROR) # Hides HuggingFace noise
+
+# --- 2. STANDARD IMPORTS ---
+import time
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.utilities import SQLDatabase
+from langchain_chroma import Chroma
+from api_connectors import get_metal_prices, get_pune_weather, get_foundry_news, format_for_llm
 load_dotenv()
-
-# 1. SETUP DATABASE & VECTOR STORE
-db_uri = f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-db = SQLDatabase.from_uri(db_uri)
-
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-vector_path = "./chroma_db"
-vector_db = Chroma(persist_directory=vector_path, embedding_function=embeddings) if os.path.exists(vector_path) else None
-
-# 2. DEFINE LIGHTWEIGHT TOOLS (Token Efficient)
-
-@tool
-def ask_database(query: str) -> str:
-    """
-    Use this to query the SQL database for counts, inventory, orders, or records.
-    Input should be a valid SQL query.
-    Schema hints:
-    - material_master (Material_Number, Material_Type)
-    - inventory_movements (Quantity, Movement_Type)
-    - production_orders (Order_Status, Product_Type)
-    - melting_heat_records (Heat_Number, Tap_Temperature_C)
-    """
-    try:
-        return db.run(query)
-    except Exception as e:
-        return f"SQL Error: {e}"
-
-@tool
-def ask_knowledge_base(query: str) -> str:
-    """
-    Use this for 'How-to', SOPs, safety rules, or defects.
-    Searches the vector database.
-    """
-    if not vector_db: return "Knowledge Base not loaded."
-    results = vector_db.similarity_search(query, k=2)
-    return "\n".join([d.page_content for d in results])
-
-@tool
-def check_market_data(query: str) -> str:
-    """
-    Use this for real-time prices (Copper, Steel, Oil) or News.
-    """
-    if "news" in query.lower():
-        return get_foundry_news()
-    return get_metal_prices()
-
-# 3. THE BRAIN CLASS
 
 class FoundryBrain:
     def __init__(self):
-        # We use 1.5-flash because it is the designated free-tier model.
-        # 2.0-flash often gates free users quickly (Error 429).
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash", 
+        # 1. SETUP GROQ (Updated Model Name)
+        # using Llama 3.3 70B (Current Stable)
+        self.llm = ChatGroq(
+            model="llama-3.3-70b-versatile", 
             temperature=0,
-            max_retries=3
+            max_retries=2,
+            api_key=os.getenv("GROQ_API_KEY")
         )
-        
-        self.tools = [ask_database, ask_knowledge_base, check_market_data]
-        
-        # New "Tool Calling" Prompt (More robust than ReAct)
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are the Foundry Sahayak. You have access to SQL, Knowledge Base, and Market Data. Use the correct tool to answer."),
-            ("user", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-        
-        self.agent = create_tool_calling_agent(self.llm, self.tools, self.prompt)
-        self.executor = AgentExecutor(agent=self.agent, tools=self.tools, verbose=True)
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5))
-    def ask(self, user_input: str):
+        # 2. LOAD SCHEMA
         try:
-            # Fallback check to avoid API calls for empty queries
-            if not user_input.strip(): return "Please ask a question.", "None"
+            with open("schema.sql", "r") as f:
+                self.schema_context = f.read()
+        except:
+            self.schema_context = "Error loading schema.sql"
+
+        # 3. CONNECT DB
+        db_uri = f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+        self.db = SQLDatabase.from_uri(db_uri)
+
+        # 4. CONNECT VECTORS (Local HF Embeddings)
+        emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        if os.path.exists("./chroma_db"):
+            self.vector_db = Chroma(persist_directory="./chroma_db", embedding_function=emb, collection_name="foundry_knowledge")
+        else:
+            self.vector_db = None
+
+    def _router(self, query):
+        """Simple keyword router to save API calls."""
+        q = query.lower()
+        if any(x in q for x in ['count', 'total', 'how many', 'inventory', 'stock', 'order', 'status', 'production', 'scrap', 'maintenance']):
+            return 'DATABASE'
+        if any(x in q for x in ['price', 'market', 'rate', 'weather', 'news', 'usd', 'cost']):
+            return 'EXTERNAL'
+        return 'KNOWLEDGE'
+
+    def ask(self, query):
+        start_time = time.time()
+        intent = self._router(query)
+        context = ""
+        source_label = ""
+
+        try:
+            # --- PATH 1: SQL DATABASE ---
+            if intent == 'DATABASE':
+                source_label = "SQL Database"
+                # Step A: Generate SQL
+                system_msg = f"""You are a PostgreSQL expert. Given the schema, write a valid SQL query to answer the user.
+                
+                SCHEMA:
+                {self.schema_context}
+                
+                RULES:
+                1. Return ONLY the SQL. No markdown (```), no explanations.
+                2. Use ILIKE for text searches.
+                3. If specific ID is unknown, use LIMIT 5.
+                
+                User: {query}"""
+                
+                sql_query = self.llm.invoke(system_msg).content.strip().replace("```sql", "").replace("```", "")
+                
+                # Step B: Execute
+                try:
+                    res = self.db.run(sql_query)
+                    context = f"SQL: {sql_query}\nDATA: {res}"
+                except Exception as e:
+                    context = f"SQL Error: {e}"
+
+            # --- PATH 2: EXTERNAL API ---
+            elif intent == 'EXTERNAL':
+                source_label = "Live API"
+                data = []
+                q_low = query.lower()
+                if "weather" in q_low: data.append(format_for_llm(get_pune_weather(), "WEATHER"))
+                if "news" in q_low: data.append(format_for_llm(get_foundry_news(), "NEWS"))
+                if any(x in q_low for x in ["price", "rate", "cost", "market"]): 
+                    data.append(format_for_llm(get_metal_prices(), "MARKETS"))
+                
+                context = "\n".join(data)
+
+            # --- PATH 3: KNOWLEDGE ---
+            else:
+                source_label = "Knowledge Base"
+                if self.vector_db:
+                    docs = self.vector_db.similarity_search(query, k=3)
+                    context = "\n".join([f"- {d.page_content}" for d in docs])
+                else:
+                    context = "No Knowledge Base found."
+
+            # --- FINAL ANSWER ---
+            final_prompt = f"""
+            You are 'Foundry Sahayak'. Answer the user using the provided context.
             
-            response = self.executor.invoke({"input": user_input})
-            return response['output'], "Agent"
+            CONTEXT ({source_label}):
+            {context}
             
+            USER QUERY: {query}
+            
+            GUIDELINES:
+            1. Be professional and concise.
+            2. If the context contains data, explicitly mention the numbers.
+            3. If context is empty, admit you don't know.
+            """
+            
+            response = self.llm.invoke(final_prompt).content
+            elapsed = round(time.time() - start_time, 2)
+            
+            return response + f"\n\n_⚡ {elapsed}s | Powered by Groq_", source_label, intent
+
         except Exception as e:
-            # Graceful Error Handling (No more stack traces in UI)
-            if "429" in str(e):
-                return "⚠️ Traffic High (Quota). Showing Cached/Fallback info if available.", "System"
-            return f"I encountered an error: {str(e)}", "System Error"
+            return f"System Error: {str(e)}", "ERROR", "ERROR"
