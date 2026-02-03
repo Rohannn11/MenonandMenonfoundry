@@ -1,140 +1,81 @@
 import yfinance as yf
 import requests
 import os
-import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- IN-MEMORY TTL CACHE ---
-_CACHE = {
-    "weather": {"data": None, "ts": 0, "ttl": 300},  # 5 min
-    "market": {"data": None, "ts": 0, "ttl": 180},   # 3 min
-    "news": {"data": None, "ts": 0, "ttl": 600}      # 10 min
-}
-
-def _get_from_cache(key):
-    entry = _CACHE.get(key)
-    if entry["data"] and (time.time() - entry["ts"] < entry["ttl"]):
-        return entry["data"]
-    return None
-
-def _set_cache(key, data):
-    _CACHE[key]["data"] = data
-    _CACHE[key]["ts"] = time.time()
-    return data
-
-def format_for_llm(data_dict, title="DATA"):
-    """Helper to convert dicts to clean, tagged text for the LLM."""
-    if not isinstance(data_dict, dict) and not isinstance(data_dict, list):
-        return str(data_dict)
-    
-    output = [f"--- {title} ---"]
-    if isinstance(data_dict, dict):
-        for k, v in data_dict.items():
-            output.append(f"{k}: {v}")
-    elif isinstance(data_dict, list):
-        for item in data_dict:
-            output.append(f"- {item}")
-    return "\n".join(output)
-
-def get_metal_prices():
-    """Returns structured dict of relevant market prices."""
-    cached = _get_from_cache("market")
-    if cached: return cached
-
-    # Valid Yahoo Finance Tickers for Metal/Energy/Currency
-    tickers = {
-        "Copper_Futures": "HG=F",
-        "Aluminum_Futures": "ALI=F",
-        "Crude_Oil": "CL=F",
-        "USD_INR": "INR=X"
-    }
-    
-    result = {}
+# --- DYNAMIC MARKET TOOL ---
+def get_market_data(query: str):
+    """
+    Fetches market data for ANY ticker symbol or search term.
+    The LLM provides the 'query' (e.g., 'AAPL', 'Steel', 'INR=X').
+    """
     try:
-        for name, sym in tickers.items():
-            try:
-                t = yf.Ticker(sym)
-                # fast_info is reliable
-                price = t.fast_info.last_price
-                result[name] = round(price, 2) if price else "N/A"
-            except:
-                result[name] = "N/A"
-    except Exception as e:
-        result = {"Error": str(e)}
-
-    return _set_cache("market", result)
-
-def get_pune_weather():
-    """Returns structured dict of Pune weather."""
-    cached = _get_from_cache("weather")
-    if cached: return cached
-
-    # Open-Meteo (Free, No Key)
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": 18.5204,
-        "longitude": 73.8567,
-        "current": ["temperature_2m", "relative_humidity_2m", "weather_code"]
-    }
-    
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        data = res.json()
-        if "current" in data:
-            curr = data["current"]
-            code = curr.get("weather_code", 0)
+        # 1. Try direct ticker first
+        ticker = yf.Ticker(query)
+        info = ticker.fast_info
+        
+        # Check if valid data exists
+        if hasattr(info, 'last_price') and info.last_price is not None:
+            return f"Market Data for {query.upper()}: Current Price = {info.last_price:.2f} {info.currency}"
             
-            # Simple WMO code map
-            condition = "Clear"
-            if code > 3: condition = "Cloudy"
-            if code > 50: condition = "Rainy/Drizzle"
-            if code > 80: condition = "Storm/Heavy Rain"
-
-            result = {
-                "Location": "Pune, IN",
-                "Temperature_C": curr.get("temperature_2m"),
-                "Humidity_Pct": curr.get("relative_humidity_2m"),
-                "Condition": condition
-            }
-            return _set_cache("weather", result)
+        # 2. If direct fail, try searching (naive mapping for common terms)
+        # In a real app, we'd use a search API to find the ticker, but here we map common ones
+        common_map = {
+            "steel": "HRC=F", "copper": "HG=F", "gold": "GC=F", "oil": "CL=F",
+            "google": "GOOGL", "tesla": "TSLA", "apple": "AAPL", "bitcoin": "BTC-USD"
+        }
+        
+        sym = common_map.get(query.lower())
+        if sym:
+            t = yf.Ticker(sym)
+            return f"Market Data for {query} ({sym}): {t.fast_info.last_price:.2f}"
+            
+        return f"Could not find market data for '{query}'. Try a specific ticker symbol."
+        
     except Exception as e:
-        return {"Error": str(e)}
-    
-    return {"Status": "Unavailable"}
+        return f"Market Tool Error: {e}"
 
-def get_foundry_news():
-    """Returns list of news summaries."""
-    cached = _get_from_cache("news")
-    if cached: return cached
-
+# --- DYNAMIC NEWS TOOL ---
+def get_news(topic: str):
+    """
+    Fetches news on ANY topic the user asks about.
+    """
     api_key = os.getenv("NEWS_API_KEY")
-    if not api_key: return ["Error: NewsAPI Key Missing in .env"]
-
-    # Fetch 8 articles
-    url = f"https://newsapi.org/v2/everything?q=foundry+steel+price+metal+manufacturing&sortBy=publishedAt&pageSize=8&language=en&apiKey={api_key}"
+    if not api_key: return "NewsAPI Key Missing."
     
-    articles_out = []
+    # Dynamic URL based on input topic
+    url = f"https://newsapi.org/v2/everything?q={topic}&sortBy=publishedAt&pageSize=3&language=en&apiKey={api_key}"
+    
     try:
-        res = requests.get(url, timeout=5).json()
-        if res.get("status") == "ok":
-            for a in res.get("articles", []):
-                title = a.get("title", "No Title")
-                desc = a.get("description", "No Description")
-                src = a.get("source", {}).get("name", "Unknown")
-                # Clean format
-                articles_out.append(f"{title} - {desc} ({src})")
+        data = requests.get(url, timeout=5).json()
+        articles = data.get("articles", [])
+        if not articles:
+            return f"No news found for '{topic}'."
             
-            if not articles_out: articles_out = ["No recent news found."]
-            return _set_cache("news", articles_out)
-        else:
-            return [f"API Error: {res.get('message')}"]
+        results = [f"--- News for '{topic}' ---"]
+        for a in articles:
+            results.append(f"• {a['title']} (Source: {a['source']['name']})")
+        
+        return "\n".join(results)
     except Exception as e:
-        return [f"Connection Error: {str(e)}"]
+        return f"News Tool Error: {e}"
 
-if __name__ == "__main__":
-    # Quick Test
-    print(format_for_llm(get_metal_prices(), "MARKETS"))
-    print(format_for_llm(get_pune_weather(), "WEATHER"))
-    print(format_for_llm(get_foundry_news(), "NEWS"))
+# --- WEATHER TOOL ---
+def get_weather(location: str = "Pune"):
+    """
+    Fetches weather. Defaults to Pune but LLM can request others.
+    """
+    # Simple geocoding mapping for demo (expandable)
+    loc_map = {"pune": (18.52, 73.85), "mumbai": (19.07, 72.87), "delhi": (28.61, 77.20), "london": (51.50, -0.12)}
+    
+    lat, lon = loc_map.get(location.lower(), (18.52, 73.85)) # Default Pune
+    
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m"
+    try:
+        data = requests.get(url, timeout=5).json()
+        curr = data.get("current", {})
+        return f"Weather in {location}: {curr.get('temperature_2m')}°C, Humidity {curr.get('relative_humidity_2m')}%"
+    except:
+        return "Weather unavailable."
