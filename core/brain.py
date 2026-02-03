@@ -1,61 +1,195 @@
 import os
 from dotenv import load_dotenv
+from typing import List, Dict
+import re
 
-# --- 1. NATIVE IMPORTS (No Adapters) ---
 from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import Tool
-from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import SystemMessage
 
-# Import Tools
+# Import Tools and Router
 from core.tools import get_market_data, get_global_news, query_internal_sops
+from core.intent_router import IntentRouter, QueryIntent
 
 load_dotenv()
 
 class AgentBrain:
     def __init__(self):
-        # 2. SETUP LLM (Using Native Groq Class)
+        # 1. Initialize LLM
         self.llm = ChatGroq(
             model="llama-3.3-70b-versatile",
-            temperature=0,
+            temperature=0.3,  # Slightly higher for better reasoning
             api_key=os.getenv("GROQ_API_KEY")
         )
+        
+        # 2. Initialize Router
+        self.router = IntentRouter()
+        
+        # 3. Define Available Tools
+        self.tools = {
+            "get_market_data": get_market_data,
+            "get_global_news": get_global_news,
+            "query_internal_sops": query_internal_sops,
+        }
+        
+        # 4. System Prompt for Reasoning
+        self.system_prompt = """You are an Industrial AI Assistant for Menon & Menon Foundry.
 
-        # 3. DEFINE TOOLS
-        self.tools = [
-            get_market_data,
-            get_global_news,
-            query_internal_sops
-        ]
+Your role is to:
+1. Analyze user queries and understand their intent
+2. Provide accurate information from multiple sources
+3. Handle complex, multi-part queries by breaking them down
+4. Give professional, concise responses
 
-        # 4. DEFINE PERSONA
-        self.system_prompt = (
-            "You are the Foundry AI. "
-            "Use 'get_market_data' for prices. "
-            "Use 'query_internal_sops' for factory rules. "
-            "Use 'get_global_news' for trends. "
-            "Be professional and concise."
-        )
+Available Information Sources:
+- Market Data: Real-time commodity, metal, and stock prices
+- Industry News: Latest news on metals, manufacturing, energy
+- Internal Procedures: Foundry SOPs, safety protocols, maintenance guidelines
 
-        # 5. BUILD THE GRAPH
-        # This creates the executable agent using the Native Groq LLM
-        self.agent = create_react_agent(self.llm, self.tools)
+When you need to fetch data:
+- For price queries: Use get_market_data
+- For industry trends: Use get_global_news
+- For procedures/safety: Use query_internal_sops
 
-    def ask(self, query):
+Always explain your reasoning and cite your sources."""
+
+    def ask(self, user_query: str) -> str:
+        """
+        Main entry point for answering questions.
+        Implements step-by-step reasoning and multi-tool invocation.
+        """
+        
+        # STEP 1: Analyze Intent
+        primary_intent, secondary_intents, scores = self.router.analyze(user_query)
+        entities = self.router.extract_entities(user_query)
+        
+        # STEP 2: Route Based on Intent
+        if primary_intent == QueryIntent.PRICE_QUERY:
+            return self._handle_price_query(user_query, entities)
+        
+        elif primary_intent == QueryIntent.NEWS_QUERY:
+            return self._handle_news_query(user_query, entities)
+        
+        elif primary_intent == QueryIntent.SOP_QUERY:
+            return self._handle_sop_query(user_query, entities)
+        
+        elif primary_intent == QueryIntent.COMBINED_QUERY:
+            return self._handle_combined_query(user_query, entities, secondary_intents, scores)
+        
+        else:
+            return self._handle_general_chat(user_query)
+    
+    def _handle_price_query(self, query: str, entities: dict) -> str:
+        """Handles pure price queries."""
+        
+        asset = entities.get("asset_name") or self._extract_asset(query)
+        
+        if not asset:
+            return "❌ Could not identify what commodity or stock you're asking about. Please specify (e.g., 'steel', 'copper', 'gold')."
+        
+        # Fetch price data
+        price_data = self.tools["get_market_data"].run(asset)
+        
+        # Enhance with context
+        response = f"**Market Data Request: {asset.upper()}**\n\n{price_data}"
+        
+        # Try to add related news if requested
+        if "and news" in query.lower() or "and trends" in query.lower():
+            news_data = self.tools["get_global_news"].run(asset)
+            response += f"\n\n**Related News:**\n{news_data}"
+        
+        return response
+    
+    def _handle_news_query(self, query: str, entities: dict) -> str:
+        """Handles pure news queries."""
+        
+        topic = entities.get("topic") or self._extract_topic(query) or "manufacturing"
+        
+        news_data = self.tools["get_global_news"].run(topic)
+        
+        return f"**Industry News: {topic.upper()}**\n\n{news_data}"
+    
+    def _handle_sop_query(self, query: str, entities: dict) -> str:
+        """Handles SOP/procedure queries."""
+        
+        sop_data = self.tools["query_internal_sops"].run(query)
+        
+        return f"**Foundry Procedures & Guidelines**\n\n{sop_data}"
+    
+    def _handle_combined_query(self, query: str, entities: dict, secondary_intents: List[QueryIntent], scores: dict) -> str:
+        """Handles queries that span multiple data sources."""
+        
+        results = []
+        
+        # Collect data from all relevant sources based on scores
+        if scores.get(QueryIntent.PRICE_QUERY, 0) > 0.15 or "price" in query.lower():
+            asset = entities.get("asset_name") or self._extract_asset(query)
+            if asset:
+                price_data = self.tools["get_market_data"].run(asset)
+                results.append(f"**💰 Pricing Information:**\n{price_data}")
+        
+        if scores.get(QueryIntent.NEWS_QUERY, 0) > 0.15 or "news" in query.lower():
+            topic = entities.get("topic") or self._extract_topic(query) or "manufacturing"
+            news_data = self.tools["get_global_news"].run(topic)
+            results.append(f"**📰 Recent News:**\n{news_data}")
+        
+        if scores.get(QueryIntent.SOP_QUERY, 0) > 0.15 or any(kw in query.lower() for kw in ["procedure", "safety", "maintain", "how to"]):
+            sop_data = self.tools["query_internal_sops"].run(query)
+            results.append(f"**📋 Related Procedures:**\n{sop_data}")
+        
+        if not results:
+            return self._handle_general_chat(query)
+        
+        combined = "\n\n---\n\n".join(results)
+        
+        # Use LLM to synthesize
+        synthesis_prompt = f"""The user asked: "{query}"
+
+Here is the collected information:
+
+{combined}
+
+Please provide a clear, concise answer that combines this information to address the user's question."""
+        
         try:
-            # 6. EXECUTE
             messages = [
-                ("system", self.system_prompt),
-                ("user", query)
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=synthesis_prompt)
             ]
-            
-            response = self.agent.invoke(
-                {"messages": messages},
-                {"recursion_limit": 10}
-            )
-            
-            # 7. EXTRACT ANSWER
-            return response["messages"][-1].content
-            
+            response = self.llm.invoke(messages)
+            return response.content
+        except:
+            return combined
+    
+    def _handle_general_chat(self, query: str) -> str:
+        """Handles general knowledge questions."""
+        
+        try:
+            messages = [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=f"User Query: {query}")
+            ]
+            response = self.llm.invoke(messages)
+            return response.content
         except Exception as e:
-            return f"System Error: {str(e)}"
+            return f"❌ Error processing query: {str(e)}"
+    
+    # --- HELPER METHODS ---
+    
+    def _extract_asset(self, query: str) -> str:
+        """Extracts commodity/stock name from query."""
+        assets = ["steel", "copper", "gold", "aluminum", "oil", "silver", "iron", "tin", "nickel", "zinc", "lead"]
+        query_lower = query.lower()
+        for asset in assets:
+            if asset in query_lower:
+                return asset
+        return None
+    
+    def _extract_topic(self, query: str) -> str:
+        """Extracts industry topic from query."""
+        topics = ["auto", "automotive", "renewable", "energy", "manufacturing", "mining", "construction", "tech"]
+        query_lower = query.lower()
+        for topic in topics:
+            if topic in query_lower:
+                return topic
+        return None

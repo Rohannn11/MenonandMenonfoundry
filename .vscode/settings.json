@@ -1,7 +1,19 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.defaultEnvManager": "conda",
+    "python-envs.defaultPackageManager": "conda",
     "python-envs.pythonProjects": [],
-    "python.terminal.activateEnvironment": true
-    
+    "python.terminal.activateEnvironment": true,
+    "python.defaultInterpreterPath": "${workspaceFolder}",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.python",
+        "editor.formatOnSave": true
+    },
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache": true,
+        "**/.chroma_db": false
+    }
 }

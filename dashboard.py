@@ -256,11 +256,11 @@ with tab1:
 
 
 # ==========================================
-# TAB 2: AI AGENT (Light Purple Theme)
+# TAB 2: AI AGENT (Light Purple Theme + Processing States)
 # ==========================================
 with tab2:
     st.markdown("### 🤖 Industrial Intelligence Agent")
-    st.caption("Access Market Data, News, and Internal SOPs.")
+    st.caption("Ask about prices, news, procedures, or combine multiple queries.")
     
     # Initialize Agent
     try:
@@ -277,7 +277,9 @@ with tab2:
 
     # Chat Logic
     if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "Hello. I am connected to the Foundry Knowledge Base. How can I help?"}]
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hello! I'm the Foundry Intelligence Agent. I can help you with:\n\n📊 **Market Prices** - Ask about steel, copper, gold, oil, stocks\n📰 **Industry News** - Get latest trends and announcements\n📋 **SOPs & Procedures** - Foundry safety rules, maintenance guidelines\n🔀 **Combined Queries** - Mix multiple questions together\n\n*Example: \"What's the current steel price and any recent mining news?\"*"},
+        ]
 
     # Render History
     for msg in st.session_state.messages:
@@ -285,19 +287,22 @@ with tab2:
             st.markdown(msg["content"])
 
     # Chat Input
-    if prompt := st.chat_input("Ex: 'What is the price of steel?'"):
+    if prompt := st.chat_input("Ask about prices, news, SOPs, or combine them..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
+        
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Processing request..."):
-                if agent:
+            if agent:
+                # Show processing state with spinner
+                with st.spinner("🔄 Analyzing query... Routing to appropriate sources..."):
                     response = agent.ask(prompt)
-                    st.markdown(response)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                else:
-                    st.error("Agent is unavailable.")
+                
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+            else:
+                st.error("❌ Agent is unavailable. Check GROQ_API_KEY in .env")
 
 # ==========================================
 # 5. GLOBAL EXECUTION CONTROL

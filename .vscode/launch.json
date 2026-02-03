@@ -9,6 +9,32 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Streamlit App",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "streamlit",
+            "args": [
+                "run",
+                "${workspaceFolder}/dashboard.py"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test System",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tests/test_system.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Ingest Knowledge",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ingest_knowledge.py",
             "console": "integratedTerminal"
         }
     ]
