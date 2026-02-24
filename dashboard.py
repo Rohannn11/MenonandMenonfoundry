@@ -2,6 +2,7 @@ import streamlit as st
 import psycopg2
 import os
 import time
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -132,6 +133,123 @@ def get_db_connection():
         return psycopg2.connect(**DB_CONFIG)
     except: return None
 
+def _safe_scalar(cursor, query, default=0.0):
+    try:
+        cursor.execute(query)
+        row = cursor.fetchone()
+        if not row or row[0] is None:
+            return default
+        return float(row[0])
+    except:
+        return default
+
+@st.cache_data(ttl=45)
+def get_metal_price_usd(metal_name):
+    try:
+        api_key = os.getenv("METAL_PRICE")
+        if not api_key:
+            return None
+
+        url = f"https://api.metals.live/v1/spot/metals?api_key={api_key}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict) and "metals" in data and isinstance(data["metals"], dict):
+            for key, value in data["metals"].items():
+                if metal_name.lower() in str(key).lower():
+                    if isinstance(value, dict):
+                        price = value.get("price")
+                    else:
+                        price = value
+                    return float(price) if price is not None else None
+
+        if isinstance(data, dict) and metal_name in data:
+            value = data[metal_name]
+            if isinstance(value, dict):
+                value = value.get("price")
+            return float(value) if value is not None else None
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if metal_name.lower() in str(key).lower():
+                            return float(value)
+        return None
+    except:
+        return None
+
+def get_kpi_snapshot(conn):
+    kpi = {
+        "yield_24h": 0.0,
+        "scrap_pct": 0.0,
+        "energy_kwh_ton": 0.0,
+        "avg_pour_temp": 0.0,
+        "good_castings_today": 0.0,
+        "profit_margin": 0.0,
+        "metal_price": None,
+    }
+
+    try:
+        cursor = conn.cursor()
+
+        kpi["yield_24h"] = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(AVG("Yield_Percentage"), 0) FROM casting_records WHERE "Casting_Date" >= NOW() - INTERVAL \'24 hours\''
+        )
+
+        kpi["scrap_pct"] = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(SUM("Scrap_Castings") * 100.0 / NULLIF(SUM("Expected_Castings"), 0), 0) FROM casting_records WHERE "Casting_Date" >= NOW() - INTERVAL \'24 hours\''
+        )
+
+        kpi["energy_kwh_ton"] = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(SUM("Energy_Consumed_KWH") / NULLIF(SUM("Charge_Weight_KG") / 1000.0, 0), 0) FROM melting_heat_records WHERE "Melt_Date"::timestamp >= NOW() - INTERVAL \'24 hours\''
+        )
+
+        kpi["avg_pour_temp"] = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(AVG("Pouring_Temperature_C"), 0) FROM casting_records WHERE "Casting_Date" >= NOW() - INTERVAL \'24 hours\''
+        )
+
+        kpi["good_castings_today"] = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(SUM("Good_Castings"), 0) FROM casting_records WHERE DATE("Casting_Date") = CURRENT_DATE'
+        )
+
+        total_qty_24h = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(SUM("Order_Quantity"), 0) FROM production_orders WHERE "Created_Date" >= CURRENT_DATE - INTERVAL \'1 day\''
+        )
+        total_cost_24h = _safe_scalar(
+            cursor,
+            'SELECT COALESCE(SUM("Actual_Costs_USD"), 0) FROM production_orders WHERE "Created_Date" >= CURRENT_DATE - INTERVAL \'1 day\''
+        )
+
+        kpi_metal = os.getenv("KPI_METAL", "copper").lower()
+        metal_price = get_metal_price_usd(kpi_metal)
+        kpi["metal_price"] = metal_price
+
+        selling_multiplier = float(os.getenv("KPI_SELLING_MULTIPLIER", "1.35"))
+        if metal_price and total_qty_24h > 0:
+            estimated_revenue = total_qty_24h * metal_price * selling_multiplier
+            if estimated_revenue > 0:
+                kpi["profit_margin"] = ((estimated_revenue - total_cost_24h) / estimated_revenue) * 100.0
+
+    except:
+        pass
+
+    return kpi
+
+def _kpi_state(value, good_cond, warn_cond=None):
+    if good_cond(value):
+        return "🟢"
+    if warn_cond and warn_cond(value):
+        return "🟡"
+    return "🔴"
+
 @st.cache_resource
 def get_agent():
     return AgentBrain()
@@ -184,6 +302,7 @@ with tab1:
     conn = get_db_connection()
     if conn:
         current_state, total_rows = fetch_live_data(conn)
+        kpi_state = get_kpi_snapshot(conn)
         conn.close()
 
         if current_state:
@@ -196,6 +315,33 @@ with tab1:
             m2.metric("System Velocity", f"{velocity} events/sec")
             if velocity > 0: m3.success("SYSTEM ONLINE")
             else: m3.info("SYSTEM IDLE")
+
+            st.markdown("---")
+            st.markdown("### 📈 KPI Snapshot (Separate Section)")
+
+            yield_state = _kpi_state(kpi_state["yield_24h"], lambda v: v > 88, lambda v: 82 <= v <= 88)
+            scrap_state = _kpi_state(kpi_state["scrap_pct"], lambda v: v < 6, lambda v: 6 <= v <= 10)
+            energy_state = _kpi_state(kpi_state["energy_kwh_ton"], lambda v: v < 420, lambda v: 420 <= v <= 520)
+            temp_state = _kpi_state(kpi_state["avg_pour_temp"], lambda v: 1380 <= v <= 1450, lambda v: (1360 <= v < 1380) or (1450 < v <= 1470))
+            good_state = _kpi_state(kpi_state["good_castings_today"], lambda v: v > 120, lambda v: 80 <= v <= 120)
+            margin_state = _kpi_state(kpi_state["profit_margin"], lambda v: v > 15, lambda v: 8 <= v <= 15)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric(f"{yield_state} Current Yield % (24h)", f"{kpi_state['yield_24h']:.2f}%")
+            k2.metric(f"{scrap_state} Scrap % (24h)", f"{kpi_state['scrap_pct']:.2f}%")
+            k3.metric(f"{energy_state} Energy kWh/ton (24h)", f"{kpi_state['energy_kwh_ton']:.2f}")
+
+            k4, k5, k6 = st.columns(3)
+            k4.metric(f"{temp_state} Avg Pour Temperature (24h)", f"{kpi_state['avg_pour_temp']:.1f} °C")
+            k5.metric(f"{good_state} Good Castings Today", f"{int(kpi_state['good_castings_today'])}")
+            k6.metric(f"{margin_state} Profit Margin (Metal API)", f"{kpi_state['profit_margin']:.2f}%")
+
+            if kpi_state["metal_price"]:
+                st.caption(f"Metal Price Source: API | Metal: {os.getenv('KPI_METAL', 'copper').upper()} | Price: ${kpi_state['metal_price']:.4f}")
+            else:
+                st.caption("Metal Price Source: API unavailable (METAL_PRICE key missing/unreachable); Profit Margin may show 0.00%.")
+
+            st.caption("More KPI ideas: OEE, furnace utilization %, downtime minutes/shift, defect ppm, on-time production orders.")
 
             # Logging
             if velocity > 0:
