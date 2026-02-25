@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from typing import List, Dict
 import re
+import time
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -31,6 +32,9 @@ class AgentBrain:
             "get_global_news": get_global_news,
             "query_internal_sops": query_internal_sops,
         }
+
+        self.intent_confidence_threshold = 0.18
+        self.max_tool_retries = 2
         
         # 4. System Prompt for Reasoning
         self.system_prompt = """You are an Industrial AI Assistant for Menon & Menon Foundry.
@@ -62,6 +66,10 @@ Always explain your reasoning and cite your sources."""
         # STEP 1: Analyze Intent
         primary_intent, secondary_intents, scores = self.router.analyze(user_query)
         entities = self.router.extract_entities(user_query)
+        top_score = max(scores.values()) if scores else 0.0
+
+        if primary_intent == QueryIntent.GENERAL_CHAT and top_score < self.intent_confidence_threshold:
+            return self._handle_low_confidence(user_query)
         
         # STEP 2: Route Based on Intent
         if primary_intent == QueryIntent.PRICE_QUERY:
@@ -88,14 +96,14 @@ Always explain your reasoning and cite your sources."""
             return "❌ Could not identify what commodity or stock you're asking about. Please specify (e.g., 'steel', 'copper', 'gold')."
         
         # Fetch price data
-        price_data = self.tools["get_market_data"].run(asset)
+        price_data = self._run_tool_with_retries("get_market_data", asset)
         
         # Enhance with context
         response = f"**Market Data Request: {asset.upper()}**\n\n{price_data}"
         
         # Try to add related news if requested
         if "and news" in query.lower() or "and trends" in query.lower():
-            news_data = self.tools["get_global_news"].run(asset)
+            news_data = self._run_tool_with_retries("get_global_news", asset)
             response += f"\n\n**Related News:**\n{news_data}"
         
         return response
@@ -105,14 +113,14 @@ Always explain your reasoning and cite your sources."""
         
         topic = entities.get("topic") or self._extract_topic(query) or "manufacturing"
         
-        news_data = self.tools["get_global_news"].run(topic)
+        news_data = self._run_tool_with_retries("get_global_news", topic)
         
         return f"**Industry News: {topic.upper()}**\n\n{news_data}"
     
     def _handle_sop_query(self, query: str, entities: dict) -> str:
         """Handles SOP/procedure queries."""
         
-        sop_data = self.tools["query_internal_sops"].run(query)
+        sop_data = self._run_tool_with_retries("query_internal_sops", query)
         
         return f"**Foundry Procedures & Guidelines**\n\n{sop_data}"
     
@@ -122,19 +130,19 @@ Always explain your reasoning and cite your sources."""
         results = []
         
         # Collect data from all relevant sources based on scores
-        if scores.get(QueryIntent.PRICE_QUERY, 0) > 0.15 or "price" in query.lower():
+        if scores.get(QueryIntent.PRICE_QUERY, 0) > self.intent_confidence_threshold or "price" in query.lower():
             asset = entities.get("asset_name") or self._extract_asset(query)
             if asset:
-                price_data = self.tools["get_market_data"].run(asset)
+                price_data = self._run_tool_with_retries("get_market_data", asset)
                 results.append(f"**💰 Pricing Information:**\n{price_data}")
         
-        if scores.get(QueryIntent.NEWS_QUERY, 0) > 0.15 or "news" in query.lower():
+        if scores.get(QueryIntent.NEWS_QUERY, 0) > self.intent_confidence_threshold or "news" in query.lower():
             topic = entities.get("topic") or self._extract_topic(query) or "manufacturing"
-            news_data = self.tools["get_global_news"].run(topic)
+            news_data = self._run_tool_with_retries("get_global_news", topic)
             results.append(f"**📰 Recent News:**\n{news_data}")
         
-        if scores.get(QueryIntent.SOP_QUERY, 0) > 0.15 or any(kw in query.lower() for kw in ["procedure", "safety", "maintain", "how to"]):
-            sop_data = self.tools["query_internal_sops"].run(query)
+        if scores.get(QueryIntent.SOP_QUERY, 0) > self.intent_confidence_threshold or any(kw in query.lower() for kw in ["procedure", "safety", "maintain", "how to"]):
+            sop_data = self._run_tool_with_retries("query_internal_sops", query)
             results.append(f"**📋 Related Procedures:**\n{sop_data}")
         
         if not results:
@@ -173,6 +181,41 @@ Please provide a clear, concise answer that combines this information to address
             return response.content
         except Exception as e:
             return f"❌ Error processing query: {str(e)}"
+
+    def _handle_low_confidence(self, query: str) -> str:
+        return (
+            "I can support this best if you choose one of these request types:\n\n"
+            "1) Market pricing (e.g., copper, steel, gold)\n"
+            "2) Industry news/trends (e.g., mining, manufacturing)\n"
+            "3) Internal procedures/SOP guidance\n"
+            "4) Combined request (price + news + SOP)\n\n"
+            f"Your query: \"{query}\"\n"
+            "Try: 'Give me copper price and latest mining news'."
+        )
+
+    def _run_tool_with_retries(self, tool_name: str, tool_input: str) -> str:
+        tool = self.tools.get(tool_name)
+        if not tool:
+            return "⚠️ Tool unavailable."
+
+        last_output = "⚠️ Data temporarily unavailable."
+        for attempt in range(self.max_tool_retries + 1):
+            try:
+                output = tool.run(tool_input)
+                if output and not self._is_tool_failure(output):
+                    return output
+                last_output = output or last_output
+            except Exception as exc:
+                last_output = f"⚠️ Tool execution issue: {str(exc)[:60]}"
+
+            if attempt < self.max_tool_retries:
+                time.sleep(0.4)
+
+        return last_output
+
+    def _is_tool_failure(self, output: str) -> bool:
+        low = str(output).lower()
+        return low.startswith("❌") or "timeout" in low or "unavailable" in low
     
     # --- HELPER METHODS ---
     
