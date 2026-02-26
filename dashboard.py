@@ -122,23 +122,32 @@ st.markdown("""
         border: 1px solid #333 !important;
     }
 
-    /* === CHATBOT THEME (TAB 2) - Light Purple & Black === */
+    /* === CHATBOT THEME (TAB 2) - High Contrast Slate/Teal === */
+    .stChatMessage[data-testid="stChatMessage"] {
+        border-radius: 10px;
+        padding: 14px;
+        border: 1px solid #2d3648;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+    }
     /* User Message */
     .stChatMessage[data-testid="stChatMessage"]:nth-child(odd) {
-        background-color: #E0E0E0 !important;
-        border: 1px solid #ccc;
-        color: #000000 !important;
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        color: #e2e8f0 !important;
     }
     /* Assistant Message */
     .stChatMessage[data-testid="stChatMessage"]:nth-child(even) {
-        background-color: #E6E6FA !important;
-        border: 1px solid #9370DB;
-        color: #000000 !important;
+        background: #0b3d3a;
+        border-color: #20b2aa;
+        color: #e6fffb !important;
     }
-    /* Force text inside chat bubbles to be black for visibility */
-    .stChatMessage p {
-        color: #000000 !important;
+    /* Text inside chat bubbles */
+    .stChatMessage p, .stChatMessage li, .stChatMessage span {
+        color: inherit !important;
         font-weight: 500;
+    }
+    /* Bullets visibility */
+    .stChatMessage ul li::marker {
+        color: #a5f3fc;
     }
     /* Chat Input Area */
     .stChatInputContainer {

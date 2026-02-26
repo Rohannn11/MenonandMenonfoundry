@@ -2,10 +2,16 @@ import os
 import yfinance as yf
 import requests
 import chromadb
+import psycopg2
 from chromadb.utils import embedding_functions
 from langchain_core.tools import tool
 from typing import Optional
 import time
+
+try:
+    from InputPipeline.foundry_config import DB_CONFIG
+except Exception:
+    DB_CONFIG = None
 
 # --- METAL PRICE API HANDLER ---
 METAL_PRICE_MAP = {
@@ -19,6 +25,9 @@ METAL_PRICE_MAP = {
     "lead": "lead",
     "platinum": "platinum",
     "palladium": "palladium",
+    "iron": "iron",
+    "pig iron": "pig iron",
+    "scrap steel": "scrap steel",
 }
 
 METAL_REFERENCE_PRICES = {
@@ -32,6 +41,9 @@ METAL_REFERENCE_PRICES = {
     "lead": 2.1,
     "platinum": 960.0,
     "palladium": 1020.0,
+    "iron": 115.0,
+    "pig iron": 480.0,
+    "scrap steel": 210.0,
 }
 
 NEWS_REFERENCE = {
@@ -46,24 +58,24 @@ NEWS_REFERENCE = {
 @tool
 def get_market_data(query: str) -> str:
     """Fetches real-time market data using Metal Price API for metals, YFinance for others.
-    Tries Metal Price API first for commodity metals, falls back to YFinance.
+    Tries Metal Price API first for commodity metals, falls back to YFinance with clear fallback labeling.
     """
-    
+
     query_clean = query.lower().strip()
-    
+
     # Check if it's a metal commodity
     metal_name = None
     for key, metal_val in METAL_PRICE_MAP.items():
         if key in query_clean:
             metal_name = metal_val
             break
-    
+
     # Try Metal Price API first for metals
     if metal_name:
-        result = _fetch_from_metal_price_api(metal_name, query_clean)
+        result = _fetch_from_metal_price_api(metal_name)
         if result:
             return result
-    
+
     # Fallback to YFinance for stocks and other assets
     yf_result = _fetch_from_yfinance(query_clean)
 
@@ -71,61 +83,49 @@ def get_market_data(query: str) -> str:
         fallback_price = METAL_REFERENCE_PRICES.get(metal_name)
         if fallback_price is not None:
             formatted_price = f"${fallback_price:,.2f}" if fallback_price > 100 else f"${fallback_price:.4f}"
-            return f"✅ {metal_name.upper()} Price: {formatted_price} USD"
+            today = time.strftime("%Y-%m-%d")
+            return (
+                f"⚠️ Live data unavailable. Reference {metal_name.upper()} price (not live) as of {today}: {formatted_price} USD"
+            )
 
     return yf_result
 
-def _fetch_from_metal_price_api(metal_name: str, query: str) -> Optional[str]:
-    """Fetches metal prices from Metal Price API."""
+def _fetch_from_metal_price_api(metal_name: str) -> Optional[str]:
+    """Fetches metal prices from metals.live per-metal endpoint."""
     try:
         api_key = os.getenv("METAL_PRICE")
         if not api_key:
             return None
-        
-        # Try metals.live API endpoint
-        url = f"https://api.metals.live/v1/spot/metals?api_key={api_key}"
-        
+
+        # metals.live per-metal format: returns a list of dicts like [{"metal": price}, ...]
+        url = f"https://api.metals.live/v1/spot/{metal_name}?api_key={api_key}"
+
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        
+
         data = response.json()
-        
-        # Parse response - metals.live returns data structure
-        if "metals" in data:
-            metals_dict = data["metals"]
-            
-            # Look for the metal in different formats
-            for key, value in metals_dict.items():
-                if metal_name.lower() in key.lower():
-                    price = value.get("price", "N/A")
-                    currency = value.get("currency", "USD")
-                    
-                    # Format based on price magnitude
-                    if isinstance(price, (int, float)):
-                        if price > 100:
-                            formatted_price = f"${price:,.2f}"
-                        else:
-                            formatted_price = f"${price:.4f}"
-                    else:
-                        formatted_price = str(price)
-                    
-                    return f"✅ {metal_name.upper()} Price: {formatted_price} {currency} (Real-time)"
-        
-        # Alternative format: top-level metal keys
-        if metal_name in data:
-            price = data[metal_name].get("price") or data[metal_name]
-            if isinstance(price, (int, float)):
-                if price > 100:
-                    formatted_price = f"${price:,.2f}"
-                else:
-                    formatted_price = f"${price:.4f}"
-                return f"✅ {metal_name.upper()} Price: {formatted_price} USD (Real-time)"
-        
-        return None
-        
+
+        price_val = None
+        if isinstance(data, list) and data:
+            # Grab the first numeric value we find
+            first_entry = data[0]
+            if isinstance(first_entry, dict):
+                for _, val in first_entry.items():
+                    if isinstance(val, (int, float)):
+                        price_val = val
+                        break
+            elif isinstance(first_entry, (int, float)):
+                price_val = first_entry
+
+        if price_val is None:
+            return None
+
+        formatted_price = f"${price_val:,.2f}" if price_val > 100 else f"${price_val:.4f}"
+        return f"✅ {metal_name.upper()} Price: {formatted_price} USD (Real-time)"
+
     except requests.exceptions.Timeout:
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 def _fetch_from_yfinance(query: str) -> str:
@@ -133,18 +133,21 @@ def _fetch_from_yfinance(query: str) -> str:
     
     # Comprehensive ticker mapping
     ticker_map = {
-        # Commodity futures
-        "steel": ["HRC=F", "MT", "X"],
-        "copper": ["HG=F", "SCCO", "FCX"],
-        "aluminum": ["ALI=F", "HINDALCO.NS"],
-        "gold": ["GC=F", "GLD", "GOLD"],
-        "silver": ["SI=F", "SLV"],
+        # Commodity proxies (use actively traded equities/ETFs over illiquid futures)
+        "steel": ["SAIL.NS", "TATASTEEL.NS"],
+        "scrap steel": ["SAIL.NS", "TATASTEEL.NS"],
+        "pig iron": ["SAIL.NS", "TATASTEEL.NS"],
+        "iron": ["SAIL.NS", "TATASTEEL.NS"],
+        "copper": ["HINDCOPPER.NS", "FCX"],
+        "aluminum": ["HINDALCO.NS"],
+        "gold": ["GLD", "GOLD"],
+        "silver": ["SLV"],
         "oil": ["CL=F", "USO"],
         "gas": ["NG=F"],
-        "tin": ["TINCF"],
-        "nickel": ["NICKEL=F"],
-        "zinc": ["ZINC=F"],
-        "lead": ["LEAD=F"],
+        "tin": [],
+        "nickel": [],
+        "zinc": [],
+        "lead": [],
         
         # Currencies
         "usd": ["INR=X", "DXY=F"],
@@ -213,68 +216,71 @@ def _fetch_from_yfinance(query: str) -> str:
 # --- TOOL 2: NEWS (Enhanced) ---
 @tool
 def get_global_news(topic: str) -> str:
-    """Fetches latest news articles for a given topic."""
-    
-    api_key = os.getenv("NEWS_API_KEY")
-    if not api_key:
-        ref = NEWS_REFERENCE.get("manufacturing", [])
-        bullets = "\n".join([f"- {item}" for item in ref])
-        return f"📰 **Industry Updates: {topic.upper()}**\n\n{bullets}"
-    
-    topic_clean = topic.lower().strip()
-    
-    # Topic alias mapping
+    """Fetches latest news articles for a given topic using GNews (production-safe)."""
+
+    api_key = os.getenv("GNEWS_API_KEY")
+    topic_clean = (topic or "").lower().strip()
+
+    # Topic alias mapping (foundry-focused)
     topic_map = {
-        "steel": "steel manufacturing industry",
-        "copper": "copper mining prices",
-        "gold": "gold prices precious metals",
+        "steel": "steel manufacturing",
+        "copper": "copper prices mining",
+        "gold": "gold prices",
         "silver": "silver prices",
-        "aluminum": "aluminum industry",
+        "aluminum": "aluminum smelting",
         "oil": "oil prices energy",
         "gas": "natural gas energy",
-        "auto": "automotive industry vehicles",
-        "renewable": "renewable energy solar wind",
+        "auto": "automotive industry",
+        "renewable": "renewable energy",
         "mining": "mining industry commodities",
         "manufacturing": "manufacturing industry",
         "tech": "technology industry",
+        "pig iron": "pig iron market",
+        "scrap metal": "scrap metal prices",
+        "scrap steel": "scrap steel prices",
+        "ductile iron": "ductile iron foundry",
+        "grey iron": "grey iron foundry",
+        "casting": "metal casting foundry",
+        "foundry": "foundry industry",
+        "inoculant": "foundry inoculant",
+        "lme": "LME metals prices",
+        "mcx": "MCX metals prices",
     }
-    
-    search_topic = topic_map.get(topic_clean, topic_clean)
-    
+
+    search_topic = topic_map.get(topic_clean, topic_clean or "manufacturing")
+
+    if not api_key:
+        return f"⚠️ News API key missing. Cannot fetch news for '{search_topic}'."
+
     try:
-        url = f"https://newsapi.org/v2/everything?q={search_topic}&sortBy=publishedAt&pageSize=5&language=en&apiKey={api_key}"
-        
+        url = (
+            "https://gnews.io/api/v4/search"
+            f"?q={requests.utils.quote(search_topic)}&lang=en&max=5&sortby=publishedAt&token={api_key}"
+        )
+
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
-        if data.get("status") != "ok":
-            return f"⚠️ No news available for '{topic}'."
-        
+
         articles = data.get("articles", [])
         if not articles:
-            return f"⚠️ No news found for '{topic}'."
-        
-        results = [f"📰 **Latest News: {topic.upper()}**\n"]
-        
+            return f"⚠️ No news found for '{search_topic}'."
+
+        results = []
         for i, article in enumerate(articles[:5], 1):
-            title = article.get("title", "N/A")[:80]
+            title = (article.get("title") or "N/A")[:120]
             source = article.get("source", {}).get("name", "Unknown")
-            date = article.get("publishedAt", "").split("T")[0]
-            
-            results.append(f"{i}. {title}")
-            results.append(f"   📍 {source} | {date}\n")
-        
-        return "\n".join(results)
-        
+            date = (article.get("publishedAt") or "").split("T")[0]
+            url_item = article.get("url", "")
+            results.append(f"{i}. {title}\n   {source} | {date} | {url_item}")
+
+        header = f"Latest news for: {search_topic}"
+        return "\n".join([header] + results)
+
     except requests.exceptions.Timeout:
-        ref = NEWS_REFERENCE.get("manufacturing", [])
-        bullets = "\n".join([f"- {item}" for item in ref])
-        return f"📰 **Industry Updates: {topic.upper()}**\n\n{bullets}"
-    except Exception as e:
-        ref = NEWS_REFERENCE.get("manufacturing", [])
-        bullets = "\n".join([f"- {item}" for item in ref])
-        return f"📰 **Industry Updates: {topic.upper()}**\n\n{bullets}"
+        return f"⚠️ News request timed out for '{search_topic}'."
+    except Exception as exc:
+        return f"⚠️ News fetch error for '{search_topic}': {str(exc)[:80]}"
 
 
 # --- TOOL 3: INTERNAL SOPs ---
@@ -304,3 +310,58 @@ def query_internal_sops(query: str) -> str:
         
     except Exception as e:
         return f"❌ Knowledge Base Error: {str(e)[:50]}"
+
+
+# --- TOOL 4: READ-ONLY POSTGRES QUERIES ---
+@tool
+def query_foundry_db(sql: str) -> str:
+    """Executes a read-only SQL query against the foundry PostgreSQL DB. ONLY SELECT statements are allowed."""
+
+    if not DB_CONFIG:
+        return "❌ Database config not available. Check environment variables."
+
+    sql_clean = (sql or "").strip().rstrip(";")
+    lowered = sql_clean.lower()
+    forbidden = ["update", "delete", "insert", "drop", "alter", "truncate"]
+    if any(f" {kw} " in f" {lowered} " for kw in forbidden) or not lowered.startswith("select"):
+        return "❌ Only SELECT queries are allowed."
+
+    # Enforce a hard LIMIT to avoid large result sets
+    if " limit " not in lowered:
+        sql_clean += " LIMIT 50"
+
+    try:
+        conn = psycopg2.connect(
+            **DB_CONFIG,
+            options="-c default_transaction_read_only=on -c statement_timeout=5000",
+        )
+        cur = conn.cursor()
+        cur.execute(sql_clean)
+        rows = cur.fetchall()
+        headers = [desc[0] for desc in cur.description]
+    except Exception as exc:
+        return f"❌ DB query failed: {str(exc)[:120]}"
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    if not rows:
+        return "⚠️ Query returned no rows."
+
+    # Format as a compact markdown table (max 50 rows enforced above)
+    def fmt(val):
+        return "" if val is None else str(val)
+
+    header_line = " | ".join(headers)
+    divider = " | ".join(["---"] * len(headers))
+    body_lines = []
+    for r in rows:
+        body_lines.append(" | ".join(fmt(v) for v in r))
+
+    table = "\n".join([header_line, divider] + body_lines)
+    return f"✅ Query OK (max 50 rows)\n\n{table}"
