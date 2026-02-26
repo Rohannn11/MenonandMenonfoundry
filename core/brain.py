@@ -55,18 +55,30 @@ class AgentBrain:
     - query_internal_sops: internal SOP knowledge base
     - query_foundry_db: read-only Postgres SELECT (ensure LIMIT 50)
 
-    DB schema cheat sheet (partial):
-    - melting_heat_records(tap_temperature_c, pour_temperature_c, melt_date, heat_number, furnace_id, shift, operator_id, quality_status)
-    - casting_records(casting_batch, heat_number, production_order, casting_date, good_castings, scrap_castings, yield_pct)
-    - heat_treatment(ht_batch_number, casting_batch, treatment_date, treatment_type, target_temperature_c, actual_temperature_c)
-    - quality_inspections(inspection_lot, production_order, inspection_stage, defect_count, overall_decision)
-    - production_orders(production_order, material_number, order_quantity, confirmed_quantity, scrap_quantity, order_status, planned_end_date)
-    - material_master(material_number, description, base_unit, standard_price_usd, plant, storage_location)
+    DB schema cheat sheet:
+    - material_master(material_number, material_type, description, base_unit, plant, safety_stock, standard_price_usd)
+    - bill_of_materials(bom_number, parent_material, component_material, component_quantity, component_type)
+    - production_orders(production_order, product_type, alloy_grade, order_quantity, confirmed_quantity, scrap_quantity, order_status, planned_end_date)
+    - melting_heat_records(heat_number, melt_date, furnace_id, tap_temperature_c, pour_temperature_c, quality_status, yield_pct, energy_kwh)
+    - molding_records(mold_batch, production_order, molding_type, planned_quantity, actual_quantity, quality_check, defect_type)
+    - casting_records(casting_batch, heat_number, production_order, casting_date, good_castings, scrap_castings, yield_pct, quality_grade)
+    - heat_treatment(ht_batch_number, casting_batch, treatment_type, target_temperature_c, actual_temperature_c, quality_status)
+    - machining_operations(operation_id, production_order, machine_type, operation_type, quality_status, power_consumption_kw, quantity_processed)
+    - quality_inspections(inspection_lot, inspection_date, inspection_stage, defect_count, overall_decision, material_number)
+    - inventory_movements(document_number, posting_date, movement_type, material_number, quantity, stock_before, stock_after, amount_usd)
+    - equipment_maintenance(maintenance_order, equipment_number, maintenance_type, status, planned_start, planned_end, downtime_hours, total_cost_usd)
+
+    SQL tips:
+    - Use AVG(), SUM(), COUNT(), MIN(), MAX() for aggregates.
+    - Use GROUP BY for breakdowns (e.g., by product_type, quality_grade).
+    - Use WHERE for filtering (e.g., quality_status = 'REJECTED').
+    - Always include LIMIT 50.
 
     Rules:
     - Prefer live data; if a tool returns a reference fallback, state it clearly.
     - Only SELECT SQL is allowed for the DB tool; include LIMIT 50.
     - Be concise and avoid mentioning tool names.
+    - Format numeric answers clearly (e.g., "Average: 1425.3°C").
     """
 
     def ask(self, user_query: str) -> str:
@@ -106,14 +118,18 @@ class AgentBrain:
             return {"action": "get_market_data", "input": user_query}
         if any(w in ql for w in ["procedure", "sop", "safety", "guideline", "how to"]):
             return {"action": "query_internal_sops", "input": user_query}
-        if any(w in ql for w in ["sql", "select", "average", "sum", "count", "tap temperature", "heat", "casting", "yield", "rejection", "inspection"]):
+        if any(w in ql for w in [
+            "sql", "select", "average", "sum", "count", "tap temperature", "heat", "casting", "yield",
+            "rejection", "inspection", "inventory", "stock", "movement", "maintenance", "downtime", "machine",
+            "production order", "bom"
+        ]):
             return {"action": "query_foundry_db", "input": self._default_db_query(ql)}
 
         tools_manifest = (
             "- get_market_data: live metals/stocks\n"
             "- get_global_news: industry/foundry news\n"
             "- query_internal_sops: internal SOP KB\n"
-            "- query_foundry_db: SQL SELECT only; include LIMIT 50 (tables: melting_heat_records, casting_records, heat_treatment, quality_inspections)"
+            "- query_foundry_db: SQL SELECT only; include LIMIT 50 (tables: material_master, bill_of_materials, production_orders, melting_heat_records, molding_records, casting_records, heat_treatment, machining_operations, quality_inspections, inventory_movements, equipment_maintenance)"
         )
 
         history_text = self._format_history()
@@ -159,7 +175,12 @@ Tools:
                 HumanMessage(content=(
                     f"User asked: {user_query}\n"
                     f"Supporting data:\n{tool_output}\n"
-                    "Provide a concise, user-facing answer. Do not mention function or tool names."
+                    "Provide a concise, user-facing answer following these rules:\n"
+                    "- Do not mention function or tool names.\n"
+                    "- For single values, state clearly (e.g., 'Average tap temperature: 1425.3°C').\n"
+                    "- For lists, use bullet points.\n"
+                    "- For tables, summarize key insights rather than repeating raw data.\n"
+                    "- Highlight any warnings or anomalies.\n"
                 )),
             ]
             resp = self.llm.invoke(messages)
@@ -168,15 +189,62 @@ Tools:
             return f"⚠️ Could not summarize. Raw data: {tool_output} (error: {str(exc)[:60]})"
 
     def _default_db_query(self, ql: str) -> str:
+        # Aggregate queries (average, total, count)
+        if "average" in ql or "avg" in ql:
+            if "tap" in ql or "temperature" in ql:
+                return "SELECT ROUND(AVG(tap_temperature_c)::numeric, 1) AS avg_tap_temp_c FROM melting_heat_records"
+            if "yield" in ql:
+                return "SELECT ROUND(AVG(yield_pct)::numeric, 2) AS avg_yield_pct FROM casting_records"
+            if "downtime" in ql:
+                return "SELECT ROUND(AVG(downtime_hours)::numeric, 1) AS avg_downtime_hrs FROM equipment_maintenance"
+            if "energy" in ql:
+                return "SELECT ROUND(AVG(energy_kwh)::numeric, 1) AS avg_energy_kwh FROM melting_heat_records"
+        if "total" in ql or "sum" in ql:
+            if "scrap" in ql:
+                return "SELECT SUM(scrap_castings) AS total_scrap FROM casting_records"
+            if "downtime" in ql:
+                return "SELECT SUM(downtime_hours) AS total_downtime_hrs FROM equipment_maintenance"
+            if "cost" in ql:
+                return "SELECT SUM(total_cost_usd) AS total_maintenance_cost FROM equipment_maintenance"
+        if "count" in ql or "how many" in ql:
+            if "rejected" in ql or "rejection" in ql:
+                return "SELECT COUNT(*) AS rejected_heats FROM melting_heat_records WHERE quality_status = 'REJECTED'"
+            if "inspection" in ql:
+                return "SELECT overall_decision, COUNT(*) AS cnt FROM quality_inspections GROUP BY overall_decision"
+            if "maintenance" in ql:
+                return "SELECT maintenance_type, COUNT(*) AS cnt FROM equipment_maintenance GROUP BY maintenance_type"
+            if "order" in ql or "production" in ql:
+                return "SELECT order_status, COUNT(*) AS cnt FROM production_orders GROUP BY order_status"
+        # Breakdown queries
+        if "by product" in ql or "per product" in ql:
+            if "yield" in ql:
+                return "SELECT product_type, ROUND(AVG(yield_pct)::numeric, 2) AS avg_yield FROM casting_records GROUP BY product_type"
+            if "scrap" in ql:
+                return "SELECT product_type, SUM(scrap_castings) AS total_scrap FROM casting_records GROUP BY product_type"
+        if "by grade" in ql or "per grade" in ql:
+            return "SELECT quality_grade, COUNT(*) AS cnt FROM casting_records GROUP BY quality_grade"
+        # Detail queries
         if "tap" in ql and "temperature" in ql:
-            return "SELECT tap_temperature_c FROM melting_heat_records ORDER BY melt_date DESC LIMIT 5"
+            return "SELECT heat_number, melt_date, tap_temperature_c FROM melting_heat_records ORDER BY melt_date DESC LIMIT 10"
         if "yield" in ql:
-            return "SELECT casting_batch, yield_pct FROM casting_records ORDER BY casting_date DESC LIMIT 10"
+            return "SELECT casting_batch, casting_date, yield_pct, quality_grade FROM casting_records ORDER BY casting_date DESC LIMIT 10"
         if "scrap" in ql or "rejection" in ql:
-            return "SELECT casting_batch, scrap_castings, quality_grade FROM casting_records ORDER BY casting_date DESC LIMIT 10"
+            return "SELECT casting_batch, scrap_castings, good_castings, quality_grade FROM casting_records ORDER BY casting_date DESC LIMIT 10"
         if "inspection" in ql or "defect" in ql:
-            return "SELECT inspection_lot, inspection_stage, defect_count, overall_decision FROM quality_inspections ORDER BY inspection_lot DESC LIMIT 10"
-        return "SELECT * FROM melting_heat_records ORDER BY melt_date DESC LIMIT 5"
+            return "SELECT inspection_lot, inspection_date, inspection_stage, defect_count, overall_decision FROM quality_inspections ORDER BY inspection_date DESC LIMIT 10"
+        if "inventory" in ql or "stock" in ql or "movement" in ql:
+            return "SELECT posting_date, material_number, movement_type, quantity, stock_after FROM inventory_movements ORDER BY posting_date DESC LIMIT 15"
+        if "maintenance" in ql or "downtime" in ql:
+            return "SELECT maintenance_order, equipment_number, maintenance_type, status, downtime_hours, total_cost_usd FROM equipment_maintenance ORDER BY planned_start DESC LIMIT 15"
+        if "machine" in ql or "machining" in ql:
+            return "SELECT operation_id, machine_type, operation_type, quality_status, quantity_processed FROM machining_operations ORDER BY operation_date DESC LIMIT 15"
+        if "production" in ql or "order" in ql:
+            return "SELECT production_order, product_type, order_status, order_quantity, confirmed_quantity, planned_end_date FROM production_orders ORDER BY planned_end_date ASC LIMIT 15"
+        if "bom" in ql or "bill of material" in ql or "component" in ql:
+            return "SELECT bom_number, parent_material, component_material, component_quantity, component_type FROM bill_of_materials LIMIT 20"
+        if "energy" in ql:
+            return "SELECT heat_number, melt_date, energy_kwh FROM melting_heat_records ORDER BY melt_date DESC LIMIT 10"
+        return "SELECT heat_number, melt_date, tap_temperature_c, quality_status FROM melting_heat_records ORDER BY melt_date DESC LIMIT 10"
 
     def _remember(self, user_query: str, answer: str) -> None:
         self.history.append({"user": user_query, "assistant": answer})
