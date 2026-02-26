@@ -20,12 +20,17 @@ st.set_page_config(
 load_dotenv()
 
 # --- 2. CSS STYLING (Dual Theme) ---
+PAGE_RENDER_TS = datetime.now()
+
 st.markdown("""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500;600&display=swap');
+
     /* === GLOBAL DARK THEME (SCADA) === */
     .stApp {
-        background-color: #0b0c10;
+        background-color: #12141a;
         color: #eaeaea;
+        font-family: 'Space Grotesk', 'Inter', sans-serif;
     }
 
     /* Bright, readable text on dark background (avoid forcing ALL divs) */
@@ -44,12 +49,29 @@ st.markdown("""
         color: #a0a0a0 !important;
     }
 
+    /* === KPI CARD COMPONENT === */
+    .kpi-card {
+        background: #1c2030;
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        border: 1px solid #252d3d;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+        transition: box-shadow 0.18s, transform 0.12s;
+        min-height: 100px;
+    }
+    .kpi-card:hover {
+        box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+        transform: translateY(-1px);
+    }
+
     /* === TAB STYLING === */
     .stTabs [data-baseweb="tab-list"] {
         gap: 16px;
-        background-color: #1f2833;
+        background-color: #1a1d26;
         padding: 10px 20px;
         border-radius: 8px;
+        border: 1px solid #252d3d;
     }
     .stTabs [data-baseweb="tab"] {
         color: #BBBBBB !important;
@@ -92,9 +114,9 @@ st.markdown("""
         color: #FFFFFF !important;
     }
     .scada-card {
-        background-color: #1f2833;
-        border: 1px solid #45a29e;
-        border-radius: 4px;
+        background-color: #1a1d26;
+        border: 1px solid #2d3a4a;
+        border-radius: 8px;
         padding: 15px;
         margin-bottom: 10px;
     }
@@ -107,6 +129,19 @@ st.markdown("""
     .card-value { font-size: 24px; font-family: 'Consolas', monospace; color: #66fcf1; font-weight: bold; }
     .data-row { font-family: 'Courier New', monospace; font-size: 11px; color: #DDDDDD; margin-top: 5px; border-top: 1px solid #444; padding-top: 5px; }
     .highlight-val { color: #FFFFFF; font-weight: bold; }
+
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        border: 1px solid #2a3b4d;
+        background: linear-gradient(135deg, rgba(102,252,241,0.12), rgba(102,252,241,0.06));
+        color: #d7fdf7;
+        font-weight: 600;
+        font-size: 13px;
+    }
     
     .console-box { 
         background-color: #0d0d0d; color: #00FF00; 
@@ -1304,6 +1339,29 @@ def _kpi_state(value, good_cond, warn_cond=None):
         return "🟡"
     return "🔴"
 
+def _kpi_card(label, value, state="⚪", subtitle="", trend=None):
+    """Render an HTML KPI metric card."""
+    color_map = {"🟢": "#22c55e", "🟡": "#f59e0b", "🔴": "#ef4444"}
+    border_color = color_map.get(state, "#3f4d5e")
+    dot_color = color_map.get(state, "#64748b")
+    trend_html = ""
+    if trend is not None:
+        t_color = "#22c55e" if trend > 0 else ("#ef4444" if trend < 0 else "#94a3b8")
+        t_arrow = "▲" if trend > 0 else ("▼" if trend < 0 else "—")
+        trend_html = f'<div style="font-size:11px;color:{t_color};margin-top:6px;">{t_arrow} {trend:+.2f}</div>'
+    sub_html = f'<div style="font-size:11px;color:#64748b;margin-top:3px;">{subtitle}</div>' if subtitle else ""
+    return f"""
+    <div class="kpi-card" style="border-left:4px solid {border_color};">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div style="font-size:11px;font-weight:600;color:#7a8fa6;text-transform:uppercase;letter-spacing:0.07em;line-height:1.4;">{label}</div>
+            <div style="width:8px;height:8px;border-radius:50%;background:{dot_color};margin-top:2px;flex-shrink:0;"></div>
+        </div>
+        <div style="font-size:28px;font-family:'Consolas',monospace;font-weight:700;color:#e2e8f0;margin-top:8px;line-height:1.1;">{value}</div>
+        {sub_html}
+        {trend_html}
+    </div>
+    """
+
 def get_maintenance_snapshot(conn):
     snapshot = {
         "overdue_pm": 0,
@@ -1604,14 +1662,7 @@ with tab1:
             velocity = total_rows - st.session_state["prev_total"]
             st.session_state["prev_total"] = total_rows
 
-            # Header metrics row (always visible)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Records", f"{total_rows:,}")
-            m2.metric("System Velocity", f"{velocity} events/sec")
-            if velocity > 0: m3.success("SYSTEM ONLINE")
-            else: m3.info("SYSTEM IDLE")
-
-            # Sub-tabs within SCADA
+            # ---- Sub-tabs pulled directly below the main tab bar ----
             scada_tabs = st.tabs([
                 "📈 KPI & Overview",
                 "🧭 Control Tower & Scheduling",
@@ -1625,13 +1676,32 @@ with tab1:
             # SUB-TAB 1: KPI & OVERVIEW
             # ----------------------------------------
             with scada_tabs[0]:
-                h1, h2, h3, h4 = st.columns(4)
-                h1.metric("Database", "ONLINE")
-                h2.metric("Metal Source", kpi_meta["metal_source"])
-                h3.metric("Feed Freshness", f"{freshness_state['fresh']}/{freshness_state['total']}")
-                h4.metric("Data Quality Score", f"{analytics['quality_score']}/100")
+                # — Command Center Summary Bar —
+                sys_status = "🟢 ONLINE" if velocity > 0 else "⚪ IDLE"
+                s1, s2, s3, s4, s5 = st.columns(5)
+                s1.metric("System Status", sys_status)
+                s2.metric("Total Records", f"{total_rows:,}")
+                s3.metric("Fresh Streams", f"{freshness_state['fresh']}/{freshness_state['total']}")
+                s4.metric("Active Alerts", f"{len(alerts_state)}")
+                s5.metric("Data Quality", f"{analytics['quality_score']}/100")
+                st.caption(
+                    f"Last refresh: {PAGE_RENDER_TS.strftime('%Y-%m-%d %H:%M:%S')} · "
+                    f"Velocity: {velocity} events/cycle · Metal source: {kpi_meta['metal_source']}"
+                )
+                st.divider()
 
-                st.markdown("### 📈 KPI Snapshot")
+                # — Priority Alerts —
+                if alerts_state:
+                    st.markdown("#### 🚨 Priority Alerts")
+                    for alert in alerts_state[:3]:
+                        if alert["severity"] == "CRITICAL":
+                            st.error(f"[CRITICAL] {alert['title']} — {alert['detail']}")
+                        elif alert["severity"] == "WARN":
+                            st.warning(f"[WARN] {alert['title']} — {alert['detail']}")
+                    st.divider()
+
+                # — KPI Cards —
+                st.markdown("#### 📈 Production KPIs")
 
                 yield_state = _kpi_state(kpi_state["yield_24h"], lambda v: v > 88, lambda v: 82 <= v <= 88)
                 scrap_state = _kpi_state(kpi_state["scrap_pct"], lambda v: v < 6, lambda v: 6 <= v <= 10)
@@ -1644,56 +1714,40 @@ with tab1:
                 reject_state = _kpi_state(kpi_state["rejection_rate"], lambda v: v < 4, lambda v: 4 <= v <= 8)
                 breakdown_state = _kpi_state(kpi_state["breakdown_events_7d"], lambda v: v <= 2, lambda v: 3 <= v <= 5)
 
-                k1, k2, k3 = st.columns(3)
-                k1.metric(f"{yield_state} Current Yield % (24h)", f"{kpi_state['yield_24h']:.2f}%")
-                k2.metric(f"{scrap_state} Scrap % (24h)", f"{kpi_state['scrap_pct']:.2f}%")
-                k3.metric(f"{energy_state} Energy kWh/ton (24h)", f"{kpi_state['energy_kwh_ton']:.2f}")
+                row1 = st.columns(5)
+                row1[0].markdown(_kpi_card("Yield % (24h)", f"{kpi_state['yield_24h']:.2f}%", yield_state, "Target >88%", trend_state['yield_delta']), unsafe_allow_html=True)
+                row1[1].markdown(_kpi_card("Scrap % (24h)", f"{kpi_state['scrap_pct']:.2f}%", scrap_state, "Target <6%", trend_state['scrap_delta']), unsafe_allow_html=True)
+                row1[2].markdown(_kpi_card("Energy kWh/t", f"{kpi_state['energy_kwh_ton']:.1f}", energy_state, "Target <420", trend_state['energy_delta']), unsafe_allow_html=True)
+                row1[3].markdown(_kpi_card("Pour Temp (24h)", f"{kpi_state['avg_pour_temp']:.1f}°C", temp_state, "Target 1380–1450°C"), unsafe_allow_html=True)
+                row1[4].markdown(_kpi_card("Good Castings Today", f"{int(kpi_state['good_castings_today'])}", good_state, "Target >120"), unsafe_allow_html=True)
 
-                k4, k5, k6 = st.columns(3)
-                k4.metric(f"{temp_state} Avg Pour Temperature (24h)", f"{kpi_state['avg_pour_temp']:.1f} °C")
-                k5.metric(f"{good_state} Good Castings Today", f"{int(kpi_state['good_castings_today'])}")
-                k6.metric(f"{margin_state} Profit Margin (Metal API)", f"{kpi_state['profit_margin']:.2f}%")
+                row2 = st.columns(5)
+                row2[0].markdown(_kpi_card("Profit Margin", f"{kpi_state['profit_margin']:.2f}%", margin_state, "Metal API based"), unsafe_allow_html=True)
+                row2[1].markdown(_kpi_card("Melt Approval % (24h)", f"{kpi_state['melt_approval_pct']:.2f}%", melt_state, "Target ≥95%"), unsafe_allow_html=True)
+                row2[2].markdown(_kpi_card("Active Orders", f"{int(kpi_state['active_orders'])}", order_state, "WIP count"), unsafe_allow_html=True)
+                row2[3].markdown(_kpi_card("QC Reject Rate (7d)", f"{kpi_state['rejection_rate']:.2f}%", reject_state, "Target <4%", trend_state['reject_delta']), unsafe_allow_html=True)
+                row2[4].markdown(_kpi_card("Breakdowns (7d)", f"{int(kpi_state['breakdown_events_7d'])}", breakdown_state, "Target ≤2"), unsafe_allow_html=True)
 
-                k7, k8, k9, k10 = st.columns(4)
-                k7.metric(f"{melt_state} Melt Approval % (24h)", f"{kpi_state['melt_approval_pct']:.2f}%")
-                k8.metric(f"{order_state} Active Orders", f"{int(kpi_state['active_orders'])}")
-                k9.metric(f"{reject_state} QC Reject Rate (7d)", f"{kpi_state['rejection_rate']:.2f}%")
-                k10.metric(f"{breakdown_state} Breakdowns (7d)", f"{int(kpi_state['breakdown_events_7d'])}")
-
-                st.markdown("#### Trends")
+                st.divider()
+                st.markdown("#### 📉 24h Trend Deltas")
                 t1, t2, t3, t4 = st.columns(4)
-                t1.metric("Yield Trend (24h vs prev)", f"{trend_state['yield_delta']:+.2f} pp")
-                t2.metric("Scrap Trend (24h vs prev)", f"{trend_state['scrap_delta']:+.2f} pp")
-                t3.metric("Energy Trend (24h vs prev)", f"{trend_state['energy_delta']:+.2f}")
-                t4.metric("Reject Trend (7d vs prev)", f"{trend_state['reject_delta']:+.2f} pp")
+                t1.metric("Yield Δ (24h vs prev)", f"{trend_state['yield_delta']:+.2f} pp")
+                t2.metric("Scrap Δ (24h vs prev)", f"{trend_state['scrap_delta']:+.2f} pp")
+                t3.metric("Energy Δ (24h vs prev)", f"{trend_state['energy_delta']:+.2f}")
+                t4.metric("QC Reject Δ (7d vs prev)", f"{trend_state['reject_delta']:+.2f} pp")
 
-                st.caption(f"Inventory issue quantity (24h): {kpi_state['inventory_issue_qty_24h']:.2f}")
-
+                st.divider()
+                st.caption(f"Inventory issue qty (24h): {kpi_state['inventory_issue_qty_24h']:.2f}")
                 if kpi_meta["fallback_keys"]:
-                    fallback_list = ", ".join(sorted(set(kpi_meta["fallback_keys"])))
-                    st.caption(f"Using reference values for: {fallback_list}")
-
+                    st.caption(f"Reference values used for: {', '.join(sorted(set(kpi_meta['fallback_keys'])))}")
                 if kpi_meta.get("last_success"):
-                    last_success_text = " | ".join(
-                        [f"{k}: {_format_ts(v)}" for k, v in kpi_meta["last_success"].items()]
-                    )
-                    st.caption(f"KPI last successful updates → {last_success_text}")
-
+                    st.caption("KPI last updates → " + " | ".join([f"{k}: {_format_ts(v)}" for k, v in kpi_meta["last_success"].items()]))
                 if kpi_state["metal_price"]:
-                    st.caption(
-                        f"Metal Price Source: {kpi_meta['metal_source']} | Metal: {os.getenv('KPI_METAL', 'copper').upper()} | Price: ${kpi_state['metal_price']:.4f}"
-                    )
+                    st.caption(f"Metal: {os.getenv('KPI_METAL', 'copper').upper()} · ${kpi_state['metal_price']:.4f} · Source: {kpi_meta['metal_source']}")
                 else:
-                    st.caption("Metal Price unavailable.")
-
+                    st.caption("Metal price unavailable.")
                 if freshness_state["details"]:
-                    freshness_text = " | ".join(
-                        [
-                            f"{_freshness_icon(item['sla_state'])} {item['label']}: {_format_ts(item['latest'])}"
-                            for item in freshness_state["details"]
-                        ]
-                    )
-                    st.caption(f"Latest ingestion timestamps → {freshness_text}")
+                    st.caption("Freshness → " + " | ".join([f"{_freshness_icon(i['sla_state'])} {i['label']}: {_format_ts(i['latest'])}" for i in freshness_state["details"]]))
 
             # ----------------------------------------
             # SUB-TAB 2: CONTROL TOWER & SCHEDULING
