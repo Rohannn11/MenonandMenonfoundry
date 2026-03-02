@@ -191,6 +191,8 @@ Feeds raw production data (orders, heats, quality records, inventory, maintenanc
 | `DB_PASS` | PostgreSQL password |
 | `DB_HOST` | PostgreSQL host (default: `localhost`) |
 
+> **Note:** `NEWS_API_KEY` and `GNEWS_API_KEY` are interchangeable — set whichever fits your existing secrets manager.
+
 ---
 
 ## License

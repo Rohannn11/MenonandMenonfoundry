@@ -688,8 +688,8 @@ class TestApiTools(unittest.TestCase):
         self.assertIsInstance(r, str)
 
     def test_news_returns_string(self):
-        if not os.getenv("NEWS_API_KEY"):
-            self.skipTest("NEWS_API_KEY not set")
+        if not (os.getenv("NEWS_API_KEY") or os.getenv("GNEWS_API_KEY")):
+            self.skipTest("NEWS_API_KEY/GNEWS_API_KEY not set")
         r = self.news.run("steel")
         self.assertIsInstance(r, str)
         self.assertGreater(len(r), 0)

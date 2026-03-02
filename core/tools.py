@@ -218,7 +218,7 @@ def _fetch_from_yfinance(query: str) -> str:
 def get_global_news(topic: str) -> str:
     """Fetches latest news articles for a given topic using GNews (production-safe)."""
 
-    api_key = os.getenv("GNEWS_API_KEY")
+    api_key = os.getenv("NEWS_API_KEY") or os.getenv("GNEWS_API_KEY")
     topic_clean = (topic or "").lower().strip()
 
     # Topic alias mapping (foundry-focused)
