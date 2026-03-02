@@ -1038,7 +1038,7 @@ def get_inventory_reorder_snapshot(conn):
     return snapshot
 
 def _init_capa_state():
-    """Seed session_state keys that do not yet exist. Never mutates widget-bound keys."""
+    """Seed session_state keys that do not yet exist. Loads from PostgreSQL on first render."""
     defaults = {
         "capa_register": [],
         "capa_seq": 1,
@@ -1056,6 +1056,20 @@ def _init_capa_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    # Hydrate from DB on first load (register is empty and not yet populated this session)
+    if not st.session_state.get("capa_db_loaded"):
+        db_rows = _load_capa_from_db()
+        if db_rows:
+            st.session_state["capa_register"] = db_rows
+            seq_nums = []
+            for r in db_rows:
+                try:
+                    seq_nums.append(int(r["capa_id"].split("-")[-1]))
+                except (ValueError, IndexError):
+                    pass
+            if seq_nums:
+                st.session_state["capa_seq"] = max(seq_nums) + 1
+        st.session_state["capa_db_loaded"] = True
 
 def _flush_capa_reset():
     """Apply a pending create-form reset. MUST be called before any CAPA widgets render."""
@@ -1089,6 +1103,94 @@ def _get_capa_snapshot():
         "due_7d": len(due_7d),
         "register": sorted(register, key=lambda x: (x.get("status") == "CLOSED", x.get("due_date", "9999-12-31"))),
     }
+
+# ---- CAPA PostgreSQL persistence helpers ----
+
+def _load_capa_from_db() -> list:
+    """Load all CAPA records from PostgreSQL. Returns [] on any failure."""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                capa_id,
+                to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+                source, issue, linked_alert, owner, priority, status,
+                due_date::text, closure_notes
+            FROM capa_input
+            ORDER BY
+                CASE status WHEN 'CLOSED' THEN 1 ELSE 0 END ASC,
+                due_date ASC
+            """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "capa_id":      r[0], "created_at":   r[1], "source":        r[2],
+                "issue":        r[3], "linked_alert":  r[4], "owner":         r[5],
+                "priority":     r[6], "status":        r[7], "due_date":      r[8],
+                "closure_notes": r[9],
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def _save_capa_to_db(row: dict) -> bool:
+    """INSERT a new CAPA row into capa_input. Returns True on success."""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO capa_input
+                (capa_id, source, issue, linked_alert, owner, priority, status, due_date, closure_notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (capa_id) DO NOTHING
+            """,
+            (
+                row["capa_id"], row["source"], row["issue"],
+                row.get("linked_alert", ""), row["owner"], row["priority"],
+                row["status"], row["due_date"], row.get("closure_notes", ""),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _update_capa_in_db(capa_id: str, status: str, closure_notes: str) -> bool:
+    """UPDATE status and closure notes for an existing CAPA record. Returns True on success."""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE capa_input
+               SET status = %s,
+                   closure_notes = %s,
+                   updated_at = NOW()
+             WHERE capa_id = %s
+            """,
+            (status, closure_notes, capa_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
 
 @st.cache_data(ttl=45)
 def get_metal_price_usd(metal_name):
@@ -1856,22 +1958,24 @@ with tab1:
                     if submitted and issue.strip() and owner.strip():
                         capa_id = f"CAPA-{st.session_state['capa_seq']:04d}"
                         st.session_state["capa_seq"] += 1
-                        st.session_state["capa_register"].append(
-                            {
-                                "capa_id": capa_id,
-                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                "source": source,
-                                "issue": issue.strip(),
-                                "linked_alert": linked_alert,
-                                "owner": owner.strip(),
-                                "priority": priority,
-                                "status": "OPEN",
-                                "due_date": due_date.isoformat(),
-                                "closure_notes": "",
-                            }
-                        )
-                        st.success(f"Created {capa_id}")
-
+                        new_row = {
+                            "capa_id":      capa_id,
+                            "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "source":       source,
+                            "issue":        issue.strip(),
+                            "linked_alert": linked_alert,
+                            "owner":        owner.strip(),
+                            "priority":     priority,
+                            "status":       "OPEN",
+                            "due_date":     due_date.isoformat(),
+                            "closure_notes": "",
+                        }
+                        st.session_state["capa_register"].append(new_row)
+                        db_ok = _save_capa_to_db(new_row)
+                        if db_ok:
+                            st.success(f"✅ Created {capa_id} and saved to database.")
+                        else:
+                            st.warning(f"⚠️ Created {capa_id} in memory — database save failed. Check DB connection.")
                         # Flag to clear fields before the next render cycle
                         st.session_state["capa_reset_fields"] = True
 
@@ -1900,7 +2004,11 @@ with tab1:
                             if st.form_submit_button("Save CAPA Update"):
                                 current["status"] = status
                                 current["closure_notes"] = closure_notes.strip()
-                                st.success(f"Updated {edit_id}")
+                                db_ok = _update_capa_in_db(edit_id, status, closure_notes.strip())
+                                if db_ok:
+                                    st.success(f"✅ Updated {edit_id} in database.")
+                                else:
+                                    st.warning(f"⚠️ Updated {edit_id} in memory — database update failed. Check DB connection.")
 
                 st.dataframe(capa_state["register"], width='stretch', hide_index=True)
 
