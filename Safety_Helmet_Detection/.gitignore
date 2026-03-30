@@ -1,0 +1,7 @@
+VOC2028/
+yolo_dataset/
+.DS_Store
+runs/
+__pycache__/
+*.pt
+Test_Images/x   
